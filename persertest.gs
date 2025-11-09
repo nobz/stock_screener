@@ -254,7 +254,7 @@ function get_stocksByPage(industryNo, pageNo, useCache = true){
 
     for ( td of tr_datas){
 
-      let d = getStokData(td)
+      let d = get_stock_data(td)
 
       if ( Object.keys(d).length ){
 
@@ -278,7 +278,7 @@ function get_stocksByPage(industryNo, pageNo, useCache = true){
 /**
  * HTMLの文字列から個別銘柄情報を連想配列に抽出
  */
-function getStokData( td ){
+function get_stock_data( td ){
 
   let res = {}
 
