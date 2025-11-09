@@ -1,6 +1,52 @@
+/**
+ * スプレッドシート起動時にカスタムメニューを追加
+ * メニューから銘柄データ更新とキャッシュクリアを実行可能
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('株価取得')
+    .addItem('銘柄データ更新', 'create_pickup_stocks')
+    .addSeparator()
+    .addItem('キャッシュクリア', 'clearAllCache')
+    .addToUi();
+}
+
+/**
+ * キャッシュを完全にクリアする関数
+ */
+function clearAllCache() {
+  const cache = CacheService.getScriptCache();
+  
+  // 全てのキャッシュを削除
+  try {
+    // Apps Scriptには全削除メソッドがないので、既知のキーを削除
+    let keys = ['industry_list'];
+    
+    // 業種コード0-50、ページ1-20の範囲でクリア
+    for (let i = 0; i <= 50; i++) {
+      for (let p = 1; p <= 20; p++) {
+        keys.push('stocks_' + i + '_' + p);
+      }
+    }
+    
+    // 100個ずつ削除（removeAllの制限対策）
+    for (let i = 0; i < keys.length; i += 100) {
+      const batch = keys.slice(i, i + 100);
+      cache.removeAll(batch);
+    }
+    
+    Logger.log('キャッシュを完全にクリアしました: ' + keys.length + '個のキー');
+  } catch(e) {
+    Logger.log('キャッシュクリアエラー: ' + e.toString());
+  }
+}
+
 function create_pickup_stocks(){
 
-  const iList = create_industrycodelist()
+  // キャッシュを有効化（開発時はfalseに設定可能）
+  const USE_CACHE = true;
+  
+  const iList = create_industrycodelist(USE_CACHE)
 
   if (iList == null){
     Logger.log("業種リスト取得エラー")
@@ -12,7 +58,7 @@ function create_pickup_stocks(){
 
       for ( let pageNo = 1; pageNo<99; pageNo++ ){
 
-        res = get_stocksByPage(_d.CODE, pageNo)
+        res = get_stocksByPage(_d.CODE, pageNo, USE_CACHE)
        
         if ( res.length == 0) break
 
@@ -20,15 +66,20 @@ function create_pickup_stocks(){
       }
   }
 
+  Logger.log('取得した銘柄数: ' + stockTable.length);
+
   stockTable = stockTable.sort (function(a,b){
     _a = Number(a.TICKER)
     _b = Number(b.TICKER)
     return (_a < _b)? -1:1;
   })
 
-  ClearCells()
-
   const sheet = SpreadsheetApp.getActiveSheet()
+  
+  // シートをクリア
+  sheet.clear()
+  Logger.log('シートをクリアしました')
+  Logger.log('アクティブシート名: ' + sheet.getName());
 
   // ヘッダーとデータを配列にまとめる
   let header = ['コード','名称','PER','PBR','配当利回']
@@ -39,9 +90,28 @@ function create_pickup_stocks(){
     allData.push(_sd)
   }
 
+  Logger.log('書き込むデータ行数: ' + allData.length);
+  Logger.log('最初の3行のデータ: ' + JSON.stringify(allData.slice(0, 3)));
+
   // 一括書き込み
-  if (allData.length > 0) {
+  if (allData.length > 1) {
     sheet.getRange(1, 1, allData.length, header.length).setValues(allData)
+    
+    // コード列（A列）を右詰めに設定
+    sheet.getRange(1, 1, allData.length, 1).setHorizontalAlignment('right');
+    
+    // 名称列（B列）にYahoo!ファイナンスへのリンクを設定
+    for (let i = 0; i < stockTable.length; i++) {
+      const ticker = stockTable[i].TICKER;
+      const name = stockTable[i].NAME;
+      const url = 'https://finance.yahoo.co.jp/quote/' + ticker + '.T';
+      const formula = '=HYPERLINK("' + url + '","' + name + '")';
+      sheet.getRange(i + 2, 2).setFormula(formula);
+    }
+    
+    Logger.log('スプレッドシートに書き込み完了');
+  } else {
+    Logger.log('書き込むデータがありません');
   }
 
 }
@@ -58,8 +128,21 @@ function create_pickup_stocks(){
  * 
  * 
  */
-function create_industrycodelist(){
+function create_industrycodelist(useCache = true){
 
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'industry_list';
+  
+  // キャッシュから取得を試みる
+  if (useCache) {
+    const cached = cache.get(cacheKey);
+    if (cached != null) {
+      Logger.log('業種リストをキャッシュから取得');
+      return JSON.parse(cached);
+    }
+  }
+
+  Logger.log('業種リストを新規取得');
   let iList = new Array()
 
   for (let pageNo=1; pageNo<99; pageNo++){
@@ -76,6 +159,9 @@ function create_industrycodelist(){
     _b = Number( b.CODE)
     return (_a < _b)? -1:1;
   })
+
+  // キャッシュに保存（6時間）
+  cache.put(cacheKey, JSON.stringify(iList), 21600);
 
   return iList
 }
@@ -125,9 +211,20 @@ function get_industryByPage(pageNo){
   return iList
 }
 
-function get_stocksByPage(industryNo, pageNo){
+function get_stocksByPage(industryNo, pageNo, useCache = true){
 
   let res = new Array()
+
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'stocks_' + industryNo + '_' + pageNo;
+  
+  // キャッシュから取得を試みる
+  if (useCache) {
+    const cached = cache.get(cacheKey);
+    if (cached != null) {
+      return JSON.parse(cached);
+    }
+  }
 
   const url = 'https://kabutan.jp/themes/?industry='+industryNo + '&page='+pageNo
 
@@ -167,6 +264,10 @@ function get_stocksByPage(industryNo, pageNo){
         }
       }
     }
+
+    // キャッシュに保存（1時間）
+    cache.put(cacheKey, JSON.stringify(res), 3600);
+
   } catch(e) {
     Logger.log('Error processing stocks: ' + e.toString());
   }
@@ -179,7 +280,7 @@ function get_stocksByPage(industryNo, pageNo){
  */
 function getStokData( td ){
 
-  let res = []
+  let res = {}
 
   if (td.includes('<td class="tac">') == false) return res;
 
