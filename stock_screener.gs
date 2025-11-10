@@ -250,9 +250,9 @@ function create_industrycodelist(useCache = true){
     
     const industryList = get_industry_by_page(pageNo)
 
-    if( _list.length == 0 ) break;
+    if( industryList.length === 0 ) break;
 
-    iList = iList.concat(_list)
+    iList = iList.concat(industryList)
   }
 
   iList.sort((a, b) => Number(a.CODE) - Number(b.CODE));
