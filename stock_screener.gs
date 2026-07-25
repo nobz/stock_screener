@@ -72,15 +72,13 @@ function onOpen() {
 function clearAllCache() {
   const cache = CacheService.getScriptCache();
   
-  // 全てのキャッシュを削除
   try {
-    // Apps Scriptには全削除メソッドがないので、既知のキーを削除
-    let keys = [getCacheKey('industry', 'list')];
+    const iList = create_industrycodelist(false);
+    let keys = [];
     
-    // 業種コード0-50、ページ1-20の範囲でクリア
-    for (let i = 0; i <= CONFIG.CACHE_CLEAR_MAX_INDUSTRY; i++) {
+    for (const industry of iList) {
       for (let p = 1; p <= CONFIG.CACHE_CLEAR_MAX_PAGE; p++) {
-        keys.push(getCacheKey('stocks', i, p));
+        keys.push(getCacheKey('stocks', encodeURIComponent(industry.CODE), p));
       }
     }
     
@@ -125,11 +123,11 @@ function create_pickup_stocks(){
 
       for ( let pageNo = 1; pageNo < CONFIG.MAX_PAGES; pageNo++ ){
 
-        const stocks = get_stocks_by_page(industry.CODE, pageNo, USE_CACHE)
+        const result = get_stocks_by_page(industry.CODE, pageNo, USE_CACHE)
        
-        if ( stocks.length == 0) break
+        if ( result.done ) break  // そのページにデータなし = 最終ページ超え
 
-        stockTable = stockTable.concat(stocks)
+        stockTable = stockTable.concat(result.stocks)
       }
       
       // 進捗を更新
@@ -159,11 +157,11 @@ function create_pickup_stocks(){
   Logger.log('アクティブシート名: ' + sheet.getName());
 
   // ヘッダーとデータを配列にまとめる
-  let header = ['コード','名称','PER','PBR','配当利回']
+  let header = ['コード','名称','株価','前日比','騰落率','PER','PBR','配当利回']
   let allData = [header]
 
   for( let stock of stockTable ){
-    const rowData = [stock.TICKER, stock.NAME, stock.PER, stock.PBR, stock.DPS]
+    const rowData = [stock.TICKER, stock.NAME, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER, stock.PBR, stock.DPS]
     allData.push(rowData)
   }
 
@@ -173,10 +171,17 @@ function create_pickup_stocks(){
   // 一括書き込み
   try {
     if (allData.length > 1) {
-      sheet.getRange(1, 1, allData.length, header.length).setValues(allData)
+      const dataRange = sheet.getRange(1, 1, allData.length, header.length);
+      dataRange.setValues(allData);
+      
+      // フォントサイズを13に設定
+      dataRange.setFontSize(13);
       
       // コード列（A列）を右詰めに設定
       sheet.getRange(1, 1, allData.length, 1).setHorizontalAlignment('right');
+      
+      // 前日比（D列）と騰落率（E列）を右詰めに設定
+      sheet.getRange(1, 4, allData.length, 2).setHorizontalAlignment('right');
       
       // 名称列（B列）にYahoo!ファイナンスへのリンクを設定
       for (let i = 0; i < stockTable.length; i++) {
@@ -198,6 +203,14 @@ function create_pickup_stocks(){
     throw e;
   }
   
+  // 最終更新日時を記録（J列に移動）
+  const lastUpdateCell = sheet.getRange('J1');
+  const now = new Date();
+  const formattedDate = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+  lastUpdateCell.setValue('最終更新: ' + formattedDate);
+  lastUpdateCell.setFontSize(9);
+  lastUpdateCell.setFontColor('#666666');
+  
   // 完了メッセージを表示
   closeProgress();
 
@@ -218,80 +231,71 @@ function closeProgress() {
 }
 
 /**
- * 株探内の業種IDリストの作成
+ * 株探内の業種名リストの作成
  * 
- * 例えば海運の銘柄一覧は
- * 　https://kabutan.jp/themes/?industry=22&market=1
- * このindustryのコードを全33業種分取得する
+ * 株探のTOPIX33業種名を固定リストで返す。
+ * 新URL: https://s.kabutan.jp/sectors/業種名/?page=N
  * 
- * 一覧ページから解析する
- *  https://kabutan.jp/warning/?mode=9_1
- * 
- * 
+ * （旧: https://kabutan.jp/warning/?mode=9_1 からスクレイピング → JS動的レンダリングで取得不可）
+ * （旧: https://kabutan.jp/themes/?industry=X → 404で廃止）
  */
 function create_industrycodelist(useCache = true){
 
-  const cache = CacheService.getScriptCache();
-  const cacheKey = getCacheKey('industry', 'list');
-  
-  // キャッシュから取得を試みる
-  if (useCache) {
-    const cached = cache.get(cacheKey);
-    if (cached != null) {
-      Logger.log('業種リストをキャッシュから取得');
-      return JSON.parse(cached);
-    }
-  }
+  // TOPIX33業種の固定リスト（s.kabutan.jp/sectors/NAME/ のNAMEに対応）
+  const INDUSTRY_LIST = [
+    {CODE: '水産・農林業',      NAME: '水産・農林業'},
+    {CODE: '鉱業',              NAME: '鉱業'},
+    {CODE: '建設業',            NAME: '建設業'},
+    {CODE: '食料品',            NAME: '食料品'},
+    {CODE: '繊維製品',          NAME: '繊維製品'},
+    {CODE: 'パルプ・紙',        NAME: 'パルプ・紙'},
+    {CODE: '化学',              NAME: '化学'},
+    {CODE: '医薬品',            NAME: '医薬品'},
+    {CODE: '石油・石炭',    NAME: '石油・石炭製品'},
+    {CODE: 'ゴム製品',          NAME: 'ゴム製品'},
+    {CODE: 'ガラス・土石',  NAME: 'ガラス・土石製品'},
+    {CODE: '鉄鋼',              NAME: '鉄鋼'},
+    {CODE: '非鉄金属',          NAME: '非鉄金属'},
+    {CODE: '金属製品',          NAME: '金属製品'},
+    {CODE: '機械',              NAME: '機械'},
+    {CODE: '電気機器',          NAME: '電気機器'},
+    {CODE: '輸送用機器',        NAME: '輸送用機器'},
+    {CODE: '精密機器',          NAME: '精密機器'},
+    {CODE: 'その他製品',        NAME: 'その他製品'},
+    {CODE: '電気・ガス',      NAME: '電気・ガス業'},
+    {CODE: '陸運業',            NAME: '陸運業'},
+    {CODE: '海運業',            NAME: '海運業'},
+    {CODE: '空運業',            NAME: '空運業'},
+    {CODE: '倉庫・運輸',  NAME: '倉庫・運輸関連業'},
+    {CODE: '情報・通信業',      NAME: '情報・通信業'},
+    {CODE: '卸売業',            NAME: '卸売業'},
+    {CODE: '小売業',            NAME: '小売業'},
+    {CODE: '銀行業',            NAME: '銀行業'},
+    {CODE: '証券・商品',            NAME: '証券・商品先物取引業'},
+    {CODE: '保険業',            NAME: '保険業'},
+    {CODE: 'その他金融業',      NAME: 'その他金融業'},
+    {CODE: '不動産業',          NAME: '不動産業'},
+    {CODE: 'サービス業',        NAME: 'サービス業'},
+  ];
 
-  Logger.log('業種リストを新規取得');
-  let iList = []
-
-  for (let pageNo=1; pageNo < CONFIG.MAX_PAGES; pageNo++){
-    
-    const industryList = get_industry_by_page(pageNo)
-
-    if( industryList.length === 0 ) break;
-
-    iList = iList.concat(industryList)
-  }
-
-  iList.sort((a, b) => Number(a.CODE) - Number(b.CODE));
-
-  // キャッシュに保存
-  cache.put(cacheKey, JSON.stringify(iList), CONFIG.CACHE_INDUSTRY_DURATION);
-
-  return iList
-}
-function get_industry_by_page(pageNo){
-
-  let iList = []
-
-  const url = 'https://kabutan.jp/warning/?mode=9_1&page=' + pageNo
-
-  try {
-    const text = fetchWithUserAgent(url);
-  
-    const stock_table = Parser.data(text).from('<table class="stock_table">').to('/table>').build();
-    const tr_datas = Parser.data(stock_table).from('<tr>').to('</tr>').iterate();
-    
-    for ( const row of tr_datas){
-      const industryData = get_industry_data(row)
-      if (industryData == null) continue
-      iList.push(industryData)
-    }
-  } catch(e){
-    Logger.log('業種ページ取得エラー: ' + e.toString());
-  }
-
-  return iList
+  Logger.log('業種リストを固定値から取得: ' + INDUSTRY_LIST.length + '件');
+  return INDUSTRY_LIST;
 }
 
-function get_stocks_by_page(industryNo, pageNo, useCache = true){
-
-  let res = []
+/**
+ * 業種名でURLエンコードして銘柄一覧を取得
+ * 
+ * 新URL: https://s.kabutan.jp/sectors/業種名/?page=N
+ * 1ページ20件、?page=N でページネーション
+ * 
+ * 戻り値: { stocks: [...], done: bool }
+ *   stocks: フィルタ条件を満たす銘柄リスト
+ *   done: true = このページにデータなし → ループ終了すべき
+ */
+function get_stocks_by_page(industryCode, pageNo, useCache = true){
 
   const cache = CacheService.getScriptCache();
-  const cacheKey = getCacheKey('stocks', industryNo, pageNo);
+  const cacheKey = getCacheKey('stocks', encodeURIComponent(industryCode), pageNo);
   
   // キャッシュから取得を試みる
   if (useCache) {
@@ -301,103 +305,121 @@ function get_stocks_by_page(industryNo, pageNo, useCache = true){
     }
   }
 
-  const url = 'https://kabutan.jp/themes/?industry='+industryNo + '&page='+pageNo
+  const encodedIndustry = encodeURIComponent(industryCode);
+  const url = 'https://s.kabutan.jp/sectors/' + encodedIndustry + '/?page=' + pageNo;
+  let result = { stocks: [], done: false };
 
   try {
     const text = fetchWithUserAgent(url);
- 
-    const stock_table = Parser.data(text).from('<table class="stock_table st_market">').to('/table>').build();
 
-    const tr_datas = Parser.data(stock_table).from('<tr>').to('</tr>').iterate();
+    // <tbody>〜</tbody> を抽出
+    const tbodyMatch = text.match(/<tbody>([\s\S]*?)<\/tbody>/);
+    if (!tbodyMatch) {
+      result.done = true;
+      cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
+      return result;
+    }
 
-    for ( const row of tr_datas){
+    const tbody = tbodyMatch[1];
+    const trMatches = tbody.match(/<tr>([\s\S]*?)<\/tr>/g);
+    if (!trMatches) {
+      result.done = true;
+      cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
+      return result;
+    }
 
-      const stockData = get_stock_data(row)
-
-      if ( Object.keys(stockData).length ){
-
-        // グレアムのミックス係数
-        if( stockData.MIX < CONFIG.GRAHAM_MIX_THRESHOLD && stockData.DPS >= CONFIG.DIVIDEND_YIELD_THRESHOLD){
-          res.push(stockData)
+    let parsedCount = 0;
+    for (const row of trMatches) {
+      const stockData = get_stock_data(row);
+      if (stockData && stockData.TICKER) {
+        parsedCount++;
+        // グレアムのミックス係数フィルタ
+        if (stockData.MIX < CONFIG.GRAHAM_MIX_THRESHOLD && stockData.DPS >= CONFIG.DIVIDEND_YIELD_THRESHOLD) {
+          result.stocks.push(stockData);
         }
       }
     }
 
-    // キャッシュに保存
-    cache.put(cacheKey, JSON.stringify(res), CONFIG.CACHE_STOCK_DURATION);
+    // ティッカーが1件も取れなかった = ページ範囲外
+    if (parsedCount === 0) {
+      result.done = true;
+    }
+
+    cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
 
   } catch(e) {
-    Logger.log('銘柄ページ取得エラー (業種' + industryNo + '/ページ' + pageNo + '): ' + e.toString());
-    return res;
+    Logger.log('銘柄ページ取得エラー (業種:' + industryCode + '/ページ' + pageNo + '): ' + e.toString());
+    result.done = true;  // エラー時もループを止める
+    return result;
   }
 
-  return res
+  return result;
 }
 
 /**
- * HTMLの文字列から個別銘柄情報を連想配列に抽出
+ * HTMLの<tr>要素から個別銘柄情報を連想配列に抽出
+ * 
+ * s.kabutan.jp/sectors/業種名/ のHTML構造:
+ *   <th> 銘柄名・コード (href="/stocks/TICKER/")
+ *   <td> 株価
+ *   <td> 前日比（値と率）
+ *   <td> PER
+ *   <td> PBR
+ *   <td> 利回り
  */
-function get_stock_data( td ){
+function get_stock_data(row) {
 
-  let res = {}
+  let res = {};
 
-  if (td.includes('<td class="tac">') == false) return res;
+  // ティッカーを抽出: href="/stocks/TICKER/"
+  const tickerMatch = row.match(/href="\/stocks\/([^"\/]+)\//);
+  if (!tickerMatch) return res;
+  res.TICKER = tickerMatch[1];
 
-  //let datas = Parser.data(td).from('<td>').from('</td>').iterate();
- 
-  let datas = td.split('\r\n')
+  // 銘柄名を抽出: <abbr title="正式名称"> または <p class="...">テキスト</p>
+  const abbrMatch = row.match(/<abbr title="([^"]+)">/);
+  if (abbrMatch) {
+    res.NAME = abbrMatch[1];
+  } else {
+    const nameMatch = row.match(/<p class="font-bold[^"]*">([^<]+)<\/p>/);
+    res.NAME = nameMatch ? nameMatch[1].trim() : res.TICKER;
+  }
 
-  res.TICKER = removeHtmlTags(datas[1])
-  res.NAME = removeHtmlTags(datas[2])
-  res.PER = removeHtmlTags(datas[11])
-  res.PBR = removeHtmlTags(datas[12])
-  res.DPS = removeHtmlTags(datas[13])
+  // <td> を順番に抽出（株価、前日比、PER、PBR、利回り）
+  const tdMatches = row.match(/<td>([\s\S]*?)<\/td>/g);
+  if (!tdMatches || tdMatches.length < 5) return {};
 
-  res.MIX = Math.round(res.PER * res.PBR*1000)/1000
+  // 株価（カンマ除去）
+  res.PRICE = removeHtmlTags(tdMatches[0]).replace(/,/g, '').trim();
 
-  return res
-}
+  // 前日比: <span class='plus-num'>+129</span> or <span class='minus-num'>-10</span> or 0
+  const changeMatch = row.match(/<span class='(?:plus|minus)-num'>([^<]+)<\/span>/);
+  res.CHANGE = changeMatch ? changeMatch[1].trim() : '0';
 
+  // 騰落率: 2番目の plus-num/minus-num span（<br> 後）
+  const changeRateMatch = row.match(/<span class='text-2xs (?:plus-num|minus-num|)'>([^<]+)<\/span>/);
+  if (changeRateMatch) {
+    res.CHANGE_RATE = changeRateMatch[1].trim() + '%';
+  } else {
+    // 前日比ゼロの場合
+    const zeroRateMatch = tdMatches[1].match(/(\d+\.\d+)/);
+    res.CHANGE_RATE = zeroRateMatch ? zeroRateMatch[1] + '%' : '0%';
+  }
 
-/**
- * HTMLの文字列から業種情報を連想配列に抽出
- * 
- * 
- * 
-  <tr>
-  <td class="tac"><a href="/stock/?code=0256">0256</a></td>
-  <th scope="row" class="tal"><a href="/themes/?industry=6&market=1">パルプ・紙</a></th>
-  <td>10</td>
-  <td class="chart_icon"><a href="/stock/chart?code=0256"></a></td>
-  <td>533.08</td>
-  <td></td>
-  <td class="w61"><span class="up">+7.60</span></td>
-  <td class="w50"><span class="up">+1.45</span>%</td>
-  <td>13.8</td>
-  <td>0.59</td>
-  <td>2.32</td>
-  </tr>
- * 
- * 
- * 
- * 
- * 
- */
-function get_industry_data( td ){
+  // PER（"倍"を除去、"ー"は0扱い）
+  const perText = removeHtmlTags(tdMatches[2]).replace(/倍/g, '').trim();
+  res.PER = (perText === 'ー' || perText === '') ? 0 : parseFloat(perText);
 
-  let res = {}
+  // PBR
+  const pbrText = removeHtmlTags(tdMatches[3]).replace(/倍/g, '').trim();
+  res.PBR = (pbrText === 'ー' || pbrText === '') ? 0 : parseFloat(pbrText);
 
-  if (td.includes('<td class="tac">') == false) return null;
+  // 配当利回り（"%"を除去）
+  const dpsText = removeHtmlTags(tdMatches[4]).replace(/%/g, '').trim();
+  res.DPS = (dpsText === 'ー' || dpsText === '') ? 0 : parseFloat(dpsText);
 
-  let datas = td.split('\r\n')
+  // グレアムのミックス係数
+  res.MIX = Math.round(res.PER * res.PBR * 1000) / 1000;
 
-  // <th scope="row" class="tal"><a href="/themes/?industry=6&market=1">パルプ・紙</a></th>
-  const matchData = datas[2].match(/(?<=industry=)[0-9]+/)  // industryの値を抽出
-
-  if(matchData == null) return null;
-
-  res.CODE = matchData[0]
-  res.NAME = removeHtmlTags(datas[2])
-
-  return res
+  return res;
 }
