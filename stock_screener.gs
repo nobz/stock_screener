@@ -35,6 +35,7 @@ const SETTINGS_DEFINITIONS = [
   { key: 'minOperatingMargin', label: '【第2段階・予約】営業利益率の下限', value: 5, description: '％。業種差が大きいため最終的には業種内比較にする想定。未適用' },
   { key: 'minEquityRatio', label: '【第2段階・予約】自己資本比率の下限', value: 40, description: '％。金融業など業種によっては例外扱いにする想定。未適用' },
   { key: 'maxPayoutRatio', label: '予想配当性向の上限', value: 70, description: '％。予想1株配÷予想1株益がこれを超えると pickup の注意列に書く（除外はしない）' },
+  { key: 'maxNetToOrdinaryRatio', label: '最終益/経常益の上限（特別利益の目安）', value: 90, description: '％。予想最終益が予想経常益のこの割合を超える分は特別利益とみなし、最終益をここまで抑えた補正PERでミックス係数を計算する' },
 ];
 
 const DEFAULT_SETTINGS = SETTINGS_DEFINITIONS.reduce((acc, def) => {
@@ -318,6 +319,12 @@ function applyVolumeFilter(stocks, settings, useCache = true, onProgress, cacheO
 /** 財務の判定結果は業績が日次で変わらないため長めに持つ（CacheService の上限は6時間） */
 const CACHE_FINANCE_DURATION = 21600;
 
+/**
+ * 財務キャッシュの種別。キャッシュには読み取り済みの業績行を入れるため、
+ * 読む項目を変えたら番号を上げる（v2: 経常益を追加）
+ */
+const FINANCE_CACHE_TYPE = 'finance_v2';
+
 /** "1,234" "52*" "－" などを数値化する。読めなければ null */
 function parseFinanceNumber(text) {
   const cleaned = removeHtmlTags(String(text || '')).replace(/&nbsp;/g, '').replace(/[,*\s円]/g, '');
@@ -330,7 +337,8 @@ function parseFinanceNumber(text) {
  * PC版の行: <th scope="row"><span class="kubun1">I 予 </span>2027.03</th>
  * スマホ版の行: <th class="sticky">予 2027.03 <span ...></span></th>
  *     どちらも <td>売上高</td><td>営業益</td><td>経常益</td><td>最終益</td><td>1株益</td><td>1株配</td>... の順
- * 戻り値: [{ period, isForecast, netIncome, eps, dps }]（ページ上の順＝古い順）
+ * 戻り値: [{ period, isForecast, ordinaryIncome, netIncome, eps, dps }]（ページ上の順＝古い順）
+ * IFRS の会社は経常益の列に税引前利益が入る。
  */
 function parseAnnualResults(html) {
   const text = String(html || '');
@@ -352,6 +360,7 @@ function parseAnnualResults(html) {
     rows.push({
       period: periodMatch[1],
       isForecast: thMatch[1].indexOf('予') !== -1,
+      ordinaryIncome: parseFinanceNumber(tds[2]),
       netIncome: parseFinanceNumber(tds[3]),
       eps: parseFinanceNumber(tds[4]),
       dps: parseFinanceNumber(tds[5]),
@@ -405,6 +414,75 @@ function evaluateDividendSafety(rows, settings) {
 }
 
 /**
+ * 特別利益による PER の見かけの低さを補正する。戻り値: { adjustedPer, ratio, flags[] }
+ * 予想最終益が「予想経常益 × maxNetToOrdinaryRatio」を超える分を特別利益とみなし、
+ * 最終益をそこまで抑えて PER を計算し直す: 補正PER = PER × max(1, 比率 ÷ 上限)。
+ * 上限以下の会社は変えず、特別損失で最終益が小さい会社も持ち上げない
+ * （そうした会社は第1段階の株探PERで既に落ちており、救うと基準が揃わないため）。
+ * adjustedPer が null なら判定不能（経常赤字予想）。
+ */
+function evaluateEarningsQuality(rows, per, settings) {
+  const s = settings || DEFAULT_SETTINGS;
+  const forecasts = (rows || []).filter((r) => r.isForecast);
+  const forecast = forecasts.length > 0 ? forecasts[0] : null;
+  const ordinary = forecast ? forecast.ordinaryIncome : null;
+  const net = forecast ? forecast.netIncome : null;
+
+  if (ordinary == null || net == null) {
+    return { adjustedPer: per, ratio: null, flags: ['経常ベース判定不可'] };
+  }
+  if (net <= 0) {
+    // 予想赤字は株探PERが出ず第1段階で落ちる。ここに来たら補正しない
+    return { adjustedPer: per, ratio: null, flags: [] };
+  }
+  if (ordinary <= 0) {
+    return { adjustedPer: null, ratio: null, flags: ['経常赤字予想'] };
+  }
+
+  const ratio = net / ordinary;
+  const cap = s.maxNetToOrdinaryRatio / 100;
+  if (ratio <= cap) {
+    return { adjustedPer: per, ratio: ratio, flags: [] };
+  }
+  const adjustedPer = Math.round(per * ratio / cap * 100) / 100;
+  return {
+    adjustedPer: adjustedPer,
+    ratio: ratio,
+    flags: ['特別利益でかさ上げ（最終益/経常益 ' + Math.round(ratio * 100) + '%）'],
+  };
+}
+
+/**
+ * 候補に補正PERとミックス係数（補正後）を付け、閾値を満たさなくなった銘柄を除く。
+ * 財務が無い銘柄は株探PERのまま残す（取得失敗で落とさない方針）。
+ */
+function applyEarningsQuality(stocks, settings) {
+  const s = settings || DEFAULT_SETTINGS;
+  const kept = [];
+  const dropped = [];
+  (stocks || []).forEach((stock) => {
+    const per = Number(stock.PER);
+    let adjustedPer = per;
+    if (stock.FINANCE_ROWS) {
+      const result = evaluateEarningsQuality(stock.FINANCE_ROWS, per, s);
+      adjustedPer = result.adjustedPer;
+      stock.NOTES = (stock.NOTES || []).concat(result.flags);
+    }
+    stock.ADJUSTED_PER = adjustedPer;
+    stock.MIX = (adjustedPer !== null && stock.PBR > 0) ? Math.round(adjustedPer * stock.PBR * 1000) / 1000 : null;
+    if (stock.MIX !== null && stock.MIX < s.grahamMixThreshold) {
+      kept.push(stock);
+    } else {
+      dropped.push(stock.TICKER);
+    }
+  });
+  if (dropped.length > 0) {
+    Logger.log('補正ミックス係数で除外: ' + dropped.length + '件 (' + dropped.join(', ') + ')');
+  }
+  return kept;
+}
+
+/**
  * 銘柄の配当の持続性を取得する。戻り値: { payoutRatio, flags[] }
  * パース後の判定材料（業績行）だけを銘柄単位で6時間キャッシュする。
  * 判定は settings に依存するため、キャッシュからでも毎回やり直す。
@@ -419,7 +497,7 @@ function getDividendSafeties(tickers, settings, useCache = true, cacheOnly = fal
   const failures = new Map();
   const rowsByTicker = collectByTicker(tickers, {
     failures: failures,
-    type: 'finance',
+    type: FINANCE_CACHE_TYPE,
     useCache: useCache,
     cacheOnly: cacheOnly,
     duration: CACHE_FINANCE_DURATION,
@@ -434,11 +512,11 @@ function getDividendSafeties(tickers, settings, useCache = true, cacheOnly = fal
   tickers.forEach((ticker) => {
     const rows = rowsByTicker.get(ticker);
     if (rows) {
-      results.set(ticker, evaluateDividendSafety(rows, settings));
+      results.set(ticker, Object.assign(evaluateDividendSafety(rows, settings), { rows: rows }));
       return;
     }
     const flag = cacheOnly ? '財務データ未取得' : '財務取得失敗（' + (failures.get(ticker) || '不明') + '）';
-    results.set(ticker, { payoutRatio: null, flags: [flag] });
+    results.set(ticker, { payoutRatio: null, flags: [flag], rows: null });
   });
   return results;
 }
@@ -450,6 +528,7 @@ function applyDividendSafety(stocks, settings, useCache = true, onProgress, cach
   list.forEach((stock) => {
     const result = safeties.get(stock.TICKER);
     stock.PAYOUT_RATIO = result.payoutRatio;
+    stock.FINANCE_ROWS = result.rows;
     stock.NOTES = (stock.IS_FINANCIAL ? [FINANCIAL_NOTE] : []).concat(result.flags);
   });
   return stocks;
@@ -717,9 +796,17 @@ function runPickupCore(cacheOnly, checkBudget, startedAt){
   }, cacheOnly);
   Logger.log('ここまでの経過時間: ' + Math.round((Date.now() - startedAt) / 1000) + '秒');
 
+  // 特別利益で最終益が膨らんだ銘柄は、補正PERでミックス係数を出し直して閾値を判定し直す
+  const beforeQuality = stockTable.length;
+  stockTable = applyEarningsQuality(stockTable, settings);
+  Logger.log('補正ミックス係数: ' + beforeQuality + '件 → ' + stockTable.length + '件');
+  if (stockTable.length === 0) {
+    return finishProgress("補正後のミックス係数で条件に合う銘柄が見つかりませんでした");
+  }
+
   showProgress('pickup シートに書き込み中', 95);
 
-  // 割安な順（ミックス係数の小さい順）。同点はコード順（英字付きコードでも崩れないよう文字列比較）
+  // 割安な順（補正後のミックス係数の小さい順）。同点はコード順（英字付きコードでも崩れないよう文字列比較）
   stockTable.sort((a, b) => (a.MIX - b.MIX) || String(a.TICKER).localeCompare(String(b.TICKER)));
 
   // 出力先は pickup シートに固定する。アクティブシートを消すと settings を
@@ -735,11 +822,12 @@ function runPickupCore(cacheOnly, checkBudget, startedAt){
   Logger.log('出力シート名: ' + sheet.getName());
 
   // ヘッダーとデータを配列にまとめる
-  let header = ['コード','名称','業種','株価','前日比','騰落率','PER','PBR','配当利回','ミックス係数','購入金額（単元）','出来高（25日平均）','予想配当性向','注意']
+  let header = ['コード','名称','業種','株価','前日比','騰落率','PER','補正PER','PBR','配当利回','ミックス係数','購入金額（単元）','出来高（25日平均）','予想配当性向','注意']
   let allData = [header]
 
   for( let stock of stockTable ){
-    const rowData = [stock.TICKER, stock.NAME, stock.INDUSTRY, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER, stock.PBR, stock.DPS,
+    const rowData = [stock.TICKER, stock.NAME, stock.INDUSTRY, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER,
+      formatOrUnknown(stock.ADJUSTED_PER), stock.PBR, stock.DPS,
       stock.MIX, Number(stock.PRICE) * settings.unitShares, formatOrUnknown(stock.AVG_VOLUME),
       formatOrUnknown(stock.PAYOUT_RATIO), (stock.NOTES || []).join(' / ')]
     allData.push(rowData)
@@ -764,7 +852,7 @@ function runPickupCore(cacheOnly, checkBudget, startedAt){
       sheet.getRange(1, header.indexOf('前日比') + 1, allData.length, 2).setHorizontalAlignment('right');
 
       // シートに残った書式（通貨など）でミックス係数が「¥1」と丸まって見えたため、数値列の書式を毎回決める
-      const numberFormats = { 'ミックス係数': '0.00', '購入金額（単元）': '#,##0', '出来高（25日平均）': '#,##0', '予想配当性向': '0.0' };
+      const numberFormats = { '補正PER': '0.00', 'ミックス係数': '0.00', '購入金額（単元）': '#,##0', '出来高（25日平均）': '#,##0', '予想配当性向': '0.0' };
       Object.keys(numberFormats).forEach((name) => {
         sheet.getRange(2, header.indexOf(name) + 1, stockTable.length, 1).setNumberFormat(numberFormats[name]);
       });
@@ -805,7 +893,8 @@ function runPickupCore(cacheOnly, checkBudget, startedAt){
   return finishProgress('候補 ' + stockTable.length + '件（うち注意あり ' + flagged + '件）を pickup に出力しました');
 }
 
-const HISTORY_HEADER = ['実行日時','コード','名称','業種','株価','PER','PBR','配当利回','ミックス係数','出来高（25日平均）','予想配当性向','注意','適用設定'];
+/** 既存の history と列がずれないよう、新しい列は末尾に足す。ミックス係数は補正PERベース */
+const HISTORY_HEADER = ['実行日時','コード','名称','業種','株価','PER','PBR','配当利回','ミックス係数','出来高（25日平均）','予想配当性向','注意','適用設定','補正PER'];
 
 /**
  * 候補を history シートの末尾に追記する（後で成績を比べる効果測定用）。
@@ -820,11 +909,19 @@ function appendHistory(ss, stocks, settings, runAt) {
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, HISTORY_HEADER.length).setValues([HISTORY_HEADER]);
     sheet.setFrozenRows(1);
+  } else {
+    // 列を足す前に作られたシートは見出しが足りないので書き足す
+    const headerRange = sheet.getRange(1, 1, 1, HISTORY_HEADER.length);
+    const current = headerRange.getValues()[0];
+    if (HISTORY_HEADER.some((name, i) => current[i] !== name)) {
+      headerRange.setValues([HISTORY_HEADER]);
+    }
   }
   const settingsJson = JSON.stringify(settings);
   const rows = stocks.map((stock) => [runAt, stock.TICKER, stock.NAME, stock.INDUSTRY, stock.PRICE,
     stock.PER, stock.PBR, stock.DPS, stock.MIX, formatOrUnknown(stock.AVG_VOLUME),
-    formatOrUnknown(stock.PAYOUT_RATIO), (stock.NOTES || []).join(' / '), settingsJson]);
+    formatOrUnknown(stock.PAYOUT_RATIO), (stock.NOTES || []).join(' / '), settingsJson,
+    formatOrUnknown(stock.ADJUSTED_PER)]);
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HISTORY_HEADER.length).setValues(rows);
 }
 

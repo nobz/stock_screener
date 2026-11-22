@@ -137,7 +137,7 @@ function loadModules() {
     src + '; return { get_stock_data, get_stocks_by_page, get_neatprice,'
     + ' getprice_kabutan, clearAllCache, CONFIG, DEFAULT_SETTINGS, getMaxStockPrice,'
     + ' parseDailyVolumes, computeAverageVolume, getAverageVolume, applyVolumeFilter, getCachedStocksByPage,'
-    + ' parseAnnualResults, evaluateDividendSafety, getDividendSafety, ensureSettingsSheet,'
+    + ' parseAnnualResults, evaluateDividendSafety, getDividendSafety, ensureSettingsSheet, evaluateEarningsQuality,'
     + ' create_pickup_stocks, create_pickup_stocks_from_cache, getProgress, runPickup,'
     + ' createYahooFinanceFormula: typeof createYahooFinanceFormula === "function"'
     + ' ? createYahooFinanceFormula : undefined };'
@@ -339,11 +339,11 @@ test('キャッシュが無いページはネットに出ず cacheMiss になる
   assert.equal(vol[0].AVG_VOLUME, null);
 });
 
-// 株探の財務ページ風HTML（通期業績表）。rows: [period, isForecast, netIncome, eps, dps]
+// 株探の財務ページ風HTML（通期業績表）。rows: [period, isForecast, netIncome, eps, dps, ordinaryIncome]
 function financeHtml(rows) {
-  const trs = rows.map(([period, isForecast, netIncome, eps, dps]) =>
+  const trs = rows.map(([period, isForecast, netIncome, eps, dps, ordinaryIncome = '110,000']) =>
     `<tr ><th scope="row" ><span class="kubun1">I&nbsp;&nbsp;${isForecast ? '予&nbsp;' : ' &nbsp;'}</span>${period}&nbsp;&nbsp;</th>`
-    + `<td>1,000,000</td><td>100,000</td><td>110,000</td><td class="high">${netIncome}</td>`
+    + `<td>1,000,000</td><td>100,000</td><td>${ordinaryIncome}</td><td class="high">${netIncome}</td>`
     + `<td>${eps}</td><td>${dps}</td><td class="fb_pdf1"><a>26/05/08</a></td></tr>`);
   return `<table><thead><tr><th scope="col">決算期</th><th>売上高</th><th>営業益</th><th>経常益</th><th>最終益</th>`
     + `<th><span class="help-label" data-help="修正1株益">修正1株益</span></th>`
@@ -359,7 +359,7 @@ test('通期業績表から実績と予想を読み取る', () => {
     ['2027.03', true, '3,570,000', '304.3', '100'],
   ]));
   assert.equal(rows.length, 3);
-  assert.deepEqual(rows[2], { period: '2027.03', isForecast: true, netIncome: 3570000, eps: 304.3, dps: 100 });
+  assert.deepEqual(rows[2], { period: '2027.03', isForecast: true, ordinaryIncome: 110000, netIncome: 3570000, eps: 304.3, dps: 100 });
   assert.equal(rows[0].isForecast, false);
 });
 
@@ -375,8 +375,8 @@ test('スマホ版（s.kabutan.jp）の業績表と日足も読める', () => {
     + spRow('2026.03', '3,848,098', '295.3', '95') + spRow('予 2027.03', '3,570,000', '304.3', '100')
     + `</tbody></table>`;
   assert.deepEqual(m.parseAnnualResults(finance), [
-    { period: '2026.03', isForecast: false, netIncome: 3848098, eps: 295.3, dps: 95 },
-    { period: '2027.03', isForecast: true, netIncome: 3570000, eps: 304.3, dps: 100 },
+    { period: '2026.03', isForecast: false, ordinaryIncome: 110, netIncome: 3848098, eps: 295.3, dps: 95 },
+    { period: '2027.03', isForecast: true, ordinaryIncome: 110, netIncome: 3570000, eps: 304.3, dps: 100 },
   ]);
 
   const day = (date, volume) => `<tr>\n<th class="sticky">${date}</th>\n<td>2,930.5</td><td>2,944.5</td><td>2,900.5</td><td>2,900.5</td>`
@@ -532,6 +532,77 @@ test('時間予算を超えたら打ち切って続きを返し、再実行で�
   assert.equal(fetchCount, before);
   // 打ち切り・完了のどちらでもロックは解放されている
   assert.equal(lockHeld, false);
+});
+
+test('最終益が経常益の90%を超える分だけ PER を補正し、普通の会社と特別損失の会社は変えない', () => {
+  const m = loadModules();
+  const rows = (ordinaryIncome, netIncome) => [
+    { period: '2026.03', isForecast: false, ordinaryIncome: 1000, netIncome: 700, eps: 70, dps: 30 },
+    { period: '2027.03', isForecast: true, ordinaryIncome, netIncome, eps: 70, dps: 30 },
+  ];
+  // 比率0.87（6138 相当）は補正しない
+  assert.deepEqual(m.evaluateEarningsQuality(rows(1500, 1300), 3.48, m.DEFAULT_SETTINGS).adjustedPer, 3.48);
+  // 比率5.13（544A 相当）は 2.32 × 5.13 ÷ 0.9 ≒ 13.2
+  const inflated = m.evaluateEarningsQuality(rows(1410, 7230), 2.32, m.DEFAULT_SETTINGS);
+  assert.equal(inflated.adjustedPer, 13.22);
+  assert.deepEqual(inflated.flags, ['特別利益でかさ上げ（最終益/経常益 513%）']);
+  // 比率0.44（特別損失、7214 相当）は持ち上げない
+  assert.equal(m.evaluateEarningsQuality(rows(2250, 1000), 5.19, m.DEFAULT_SETTINGS).adjustedPer, 5.19);
+  // 経常赤字予想は判定不能
+  const loss = m.evaluateEarningsQuality(rows(-100, 500), 5, m.DEFAULT_SETTINGS);
+  assert.equal(loss.adjustedPer, null);
+  assert.deepEqual(loss.flags, ['経常赤字予想']);
+  // 予想の経常益が無ければ株探PERのまま
+  const missing = m.evaluateEarningsQuality(rows(null, 500), 5, m.DEFAULT_SETTINGS);
+  assert.equal(missing.adjustedPer, 5);
+  assert.deepEqual(missing.flags, ['経常ベース判定不可']);
+  // 上限は settings で変えられる
+  const loose = Object.assign({}, m.DEFAULT_SETTINGS, { maxNetToOrdinaryRatio: 600 });
+  assert.equal(m.evaluateEarningsQuality(rows(1410, 7230), 2.32, loose).adjustedPer, 2.32);
+});
+
+// 銀行業の1ページ目に3銘柄。A は比率3（補正MIX 6.67）、B は普通（MIX 5）、C は比率6（補正MIX 13.3）
+function qualityFixtureFetch(url) {
+  const bank = encodeURIComponent('銀行業');
+  const stock = (code, per) => `<tr><th><a href="/stocks/${code}/"><abbr title="銘柄${code}">銘柄${code}</abbr></a></th>`
+    + `<td>1,000</td><td><span class='plus-num'>+10</span><br><span class="text-2xs plus-num">1.00</span></td>`
+    + `<td>${per}倍</td><td>1.0倍</td><td>4.0%</td></tr>`;
+  if (url.includes('/sectors/' + bank + '/?page=1')) {
+    return okResponse(`<tbody>${stock('1001', '2.0')}${stock('1002', '5.0')}${stock('1003', '2.0')}</tbody>`);
+  }
+  if (url.includes('/sectors/')) return okResponse('<html></html>');
+  if (url.includes('/historical_prices/daily/')) return okResponse(kabukaHtml(Array(25).fill(50000)));
+  const ratioByCode = { 1001: 3, 1002: 0.7, 1003: 6 };
+  const code = url.match(/stocks\/(\d+)\/finance/)[1];
+  const net = 1000 * ratioByCode[code];
+  return okResponse(financeHtml([
+    ['2026.03', false, String(net), '100', '30', '1,000'],
+    ['2027.03', true, String(net), '100', '30', '1,000'],
+  ]));
+}
+
+test('補正ミックス係数で閾値を判定し直して並べ、既存 history の見出しに補正PERを足す', () => {
+  const m = loadModules();
+  fetchImpl = qualityFixtureFetch;
+  const oldHistory = spreadsheet.insertSheet('history');
+  const oldHeader = ['実行日時','コード','名称','業種','株価','PER','PBR','配当利回','ミックス係数','出来高（25日平均）','予想配当性向','注意','適用設定'];
+  oldHistory.getRange(1, 1, 1, oldHeader.length).setValues([oldHeader]);
+
+  m.create_pickup_stocks();
+  const pickup = spreadsheet.getSheetByName('pickup');
+  const header = pickup.grid[0];
+  const codes = pickup.grid.slice(1).map((row) => row[0]);
+  assert.deepEqual(codes, ['1002', '1001']);
+  const rowA = pickup.grid[2];
+  assert.equal(rowA[header.indexOf('PER')], 2);
+  assert.equal(rowA[header.indexOf('補正PER')], 6.67);
+  assert.equal(rowA[header.indexOf('ミックス係数')], 6.67);
+  assert.ok(rowA[header.indexOf('注意')].includes('特別利益でかさ上げ（最終益/経常益 300%）'));
+
+  const history = spreadsheet.getSheetByName('history');
+  assert.equal(history.grid[0][13], '補正PER');
+  assert.equal(history.getLastRow(), 3);
+  assert.equal(history.grid[2][13], 6.67);
 });
 
 test('前の実行が動いている間は何もせず busy を返し、history を二重に書かない', () => {
