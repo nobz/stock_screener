@@ -9,7 +9,6 @@ const CONFIG = {
   CACHE_STOCK_DURATION: 3600, // 1時間
   USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
   CACHE_CLEAR_MAX_INDUSTRY: 50,
-  CACHE_CLEAR_MAX_PAGE: 20,
   CACHE_BATCH_SIZE: 100
 };
 
@@ -70,32 +69,31 @@ function onOpen() {
  * キャッシュを完全にクリアする関数
  */
 function clearAllCache() {
-  const cache = CacheService.getScriptCache();
-  
   try {
+    const cache = CacheService.getScriptCache();
     const iList = create_industrycodelist(false);
     let keys = [];
-    
+
+    // 取得範囲（1ページ〜MAX_PAGES未満）と揃えて全ページ分を削除する
     for (const industry of iList) {
-      for (let p = 1; p <= CONFIG.CACHE_CLEAR_MAX_PAGE; p++) {
+      for (let p = 1; p < CONFIG.MAX_PAGES; p++) {
         keys.push(getCacheKey('stocks', encodeURIComponent(industry.CODE), p));
       }
     }
-    
+
     // 100個ずつ削除（removeAllの制限対策）
     for (let i = 0; i < keys.length; i += CONFIG.CACHE_BATCH_SIZE) {
       const batch = keys.slice(i, i + CONFIG.CACHE_BATCH_SIZE);
       cache.removeAll(batch);
     }
-    
+
     Logger.log('キャッシュを完全にクリアしました: ' + keys.length + '個のキー');
+    SpreadsheetApp.getActiveSpreadsheet().toast('キャッシュをクリアしました', '完了', 3);
   } catch(e) {
     const errorMsg = 'キャッシュクリアエラー: ' + e.toString();
     Logger.log(errorMsg);
     SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, 'エラー', 10);
   }
-  
-  SpreadsheetApp.getActiveSpreadsheet().toast('キャッシュをクリアしました', '完了', 3);
 }
 
 function create_pickup_stocks(){
@@ -183,14 +181,9 @@ function create_pickup_stocks(){
       // 前日比（D列）と騰落率（E列）を右詰めに設定
       sheet.getRange(1, 4, allData.length, 2).setHorizontalAlignment('right');
       
-      // 名称列（B列）にYahoo!ファイナンスへのリンクを設定
-      for (let i = 0; i < stockTable.length; i++) {
-        const ticker = stockTable[i].TICKER;
-        const name = stockTable[i].NAME;
-        const url = 'https://finance.yahoo.co.jp/quote/' + ticker + '.T';
-        const nameFormula = '=HYPERLINK("' + url + '","' + name + '")';
-        sheet.getRange(i + 2, 2).setFormula(nameFormula);
-      }
+      // 名称列（B列）にYahoo!ファイナンスへのリンクを一括設定する
+      const nameFormulas = stockTable.map((stock) => [createYahooFinanceFormula(stock.TICKER, stock.NAME)]);
+      sheet.getRange(2, 2, stockTable.length, 1).setFormulas(nameFormulas);
       
       Logger.log('スプレッドシートに書き込み完了');
     } else {
@@ -214,6 +207,16 @@ function create_pickup_stocks(){
   // 完了メッセージを表示
   closeProgress();
 
+}
+
+/**
+ * Yahoo!ファイナンスへのリンク数式を作成
+ * 銘柄名に含まれるダブルクォートは数式の文字列としてエスケープする
+ */
+function createYahooFinanceFormula(ticker, name) {
+  const escapedName = String(name).replace(/"/g, '""');
+  const url = 'https://finance.yahoo.co.jp/quote/' + encodeURIComponent(ticker) + '.T';
+  return '=HYPERLINK("' + url + '","' + escapedName + '")';
 }
 
 /**
@@ -333,8 +336,8 @@ function get_stocks_by_page(industryCode, pageNo, useCache = true){
       const stockData = get_stock_data(row);
       if (stockData && stockData.TICKER) {
         parsedCount++;
-        // グレアムのミックス係数フィルタ
-        if (stockData.MIX < CONFIG.GRAHAM_MIX_THRESHOLD && stockData.DPS >= CONFIG.DIVIDEND_YIELD_THRESHOLD) {
+        // グレアムのミックス係数フィルタ（欠損時は判定不能として除外）
+        if (stockData.MIX !== null && stockData.MIX < CONFIG.GRAHAM_MIX_THRESHOLD && stockData.DPS >= CONFIG.DIVIDEND_YIELD_THRESHOLD) {
           result.stocks.push(stockData);
         }
       }
@@ -418,8 +421,8 @@ function get_stock_data(row) {
   const dpsText = removeHtmlTags(tdMatches[4]).replace(/%/g, '').trim();
   res.DPS = (dpsText === 'ー' || dpsText === '') ? 0 : parseFloat(dpsText);
 
-  // グレアムのミックス係数
-  res.MIX = Math.round(res.PER * res.PBR * 1000) / 1000;
+  // グレアムのミックス係数（PER・PBRのどちらかが欠損した場合は判定不能として null）
+  res.MIX = (res.PER > 0 && res.PBR > 0) ? Math.round(res.PER * res.PBR * 1000) / 1000 : null;
 
   return res;
 }

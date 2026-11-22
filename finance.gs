@@ -7,7 +7,7 @@ function getprice_kabutan(ticker_TSE) {
     const start_tag = '<span class="kabuka">';
     let neat_price = get_neatprice(url, start_tag);
 
-    if (neat_price === 'FetchError' || neat_price === 'PriceEmpty') {
+    if (neat_price === 'FetchError' || neat_price === 'PriceEmpty' || neat_price === 'PageEmpty') {
       Logger.log('株価取得失敗: ' + ticker_TSE + ' - ' + neat_price);
       return neat_price;
     }
@@ -55,7 +55,15 @@ function get_neatprice(url, start_tag) {
   const price2tail = html_str.substring(index_start + start_tag.length);
 
   const index_end = price2tail.indexOf(end_tag);
+  if (index_end === -1) {
+    Logger.log('価格タグの終了タグが見つかりません: ' + url);
+    return 'PriceEmpty';
+  }
   const price_neat = price2tail.substring(0, index_end);
+  if (price_neat === '') {
+    Logger.log('価格が空です: ' + url);
+    return 'PriceEmpty';
+  }
 
   return price_neat;
 }
