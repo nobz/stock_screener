@@ -4,4 +4,5 @@
 |---|---|
 | [bugs/](bugs/) | 不具合と対処 |
 | [deferred/](deferred/) | 先送りした要件と再開条件 |
+| [notes/](notes/) | 共有メモ（[clasp push の注意](notes/clasp-push.md)） |
 | [notes/journal/](notes/journal/) | 作業日誌（生ログ） |
