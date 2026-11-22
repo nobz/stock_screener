@@ -14,6 +14,11 @@ const CONFIG = {
 
 const SETTINGS_SHEET_NAME = 'settings';
 const OUTPUT_SHEET_NAME = 'pickup';
+const HISTORY_SHEET_NAME = 'history';
+
+/** PBR・自己資本比率の水準が事業会社と異なるため、注意列で区別する業種（create_industrycodelist の CODE） */
+const FINANCIAL_INDUSTRY_CODES = ['銀行業', '証券・商品', '保険業', 'その他金融業'];
+const FINANCIAL_NOTE = '金融業（PBR・自己資本比率の水準が事業会社と異なる）';
 
 /**
  * settings シートの定義。キーはコード内での名前、値は C 列でユーザーが編集する。
@@ -29,7 +34,7 @@ const SETTINGS_DEFINITIONS = [
   { key: 'minRoe', label: '【第2段階・予約】ROE の下限', value: 8, description: '％。今の稼ぐ力の判定用。個別財務取得を入れるまでは未適用' },
   { key: 'minOperatingMargin', label: '【第2段階・予約】営業利益率の下限', value: 5, description: '％。業種差が大きいため最終的には業種内比較にする想定。未適用' },
   { key: 'minEquityRatio', label: '【第2段階・予約】自己資本比率の下限', value: 40, description: '％。金融業など業種によっては例外扱いにする想定。未適用' },
-  { key: 'maxPayoutRatio', label: '【第2段階・予約】配当性向の上限', value: 70, description: '％。高利回りでも稼ぎ以上に配っていないかの判定用。未適用' },
+  { key: 'maxPayoutRatio', label: '予想配当性向の上限', value: 70, description: '％。予想1株配÷予想1株益がこれを超えると pickup の注意列に書く（除外はしない）' },
 ];
 
 const DEFAULT_SETTINGS = SETTINGS_DEFINITIONS.reduce((acc, def) => {
@@ -39,7 +44,8 @@ const DEFAULT_SETTINGS = SETTINGS_DEFINITIONS.reduce((acc, def) => {
 
 /**
  * settings シートが無ければ作り、不足している項目行だけを末尾に足す。
- * 既存の値（C列）は絶対に上書きしない。
+ * 定義済みキーの設定名（B列）と説明（D列）は定義に合わせて更新するが、
+ * 値（C列）は絶対に上書きしない。
  */
 function ensureSettingsSheet(ss) {
   const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -56,8 +62,18 @@ function ensureSettingsSheet(ss) {
   const lastRow = sheet.getLastRow();
   const knownKeys = new Set();
   if (lastRow >= 2) {
-    sheet.getRange(2, 1, lastRow - 1, 1).getValues()
-      .forEach((row) => { if (row[0]) knownKeys.add(String(row[0])); });
+    const rows = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
+    rows.forEach((row, index) => {
+      if (!row[0]) return;
+      const key = String(row[0]);
+      knownKeys.add(key);
+      const def = SETTINGS_DEFINITIONS.find((d) => d.key === key);
+      if (def && (row[1] !== def.label || row[3] !== def.description)) {
+        const sheetRow = index + 2;
+        sheet.getRange(sheetRow, 2).setValue(def.label);
+        sheet.getRange(sheetRow, 4).setValue(def.description);
+      }
+    });
   }
 
   const missing = SETTINGS_DEFINITIONS.filter((def) => !knownKeys.has(def.key));
@@ -134,10 +150,11 @@ function parseDailyVolumes(html) {
   const volumes = [];
   const trMatches = String(html || '').match(/<tr>[\s\S]*?<\/tr>/g) || [];
   for (const row of trMatches) {
-    if (!/<time\s+datetime=/.test(row)) continue;
+    // PC版は <time datetime=...>、スマホ版は <th class="sticky">11/20</th> が日付の行
+    if (!/<time\s+datetime=/.test(row) && !/<th class="sticky">\s*\d{1,2}\/\d{1,2}\s*<\/th>/.test(row)) continue;
     const tdMatches = row.match(/<td>([\s\S]*?)<\/td>/g);
     if (!tdMatches || tdMatches.length < 7) continue;
-    const volumeText = removeHtmlTags(tdMatches[tdMatches.length - 1]).replace(/,/g, '').trim();
+    const volumeText = removeHtmlTags(tdMatches[tdMatches.length - 1]).replace(/[,株]/g, '').trim();
     if (!/^\d+$/.test(volumeText)) continue;
     volumes.push(Number(volumeText));
   }
@@ -159,32 +176,116 @@ function computeAverageVolume(volumes, days) {
  * できないため）。実害は最大1時間古い出来高で判定すること。
  */
 function getAverageVolume(ticker, useCache = true, cacheOnly = false) {
+  return getAverageVolumes([ticker], useCache, cacheOnly).get(ticker);
+}
+
+const UNKNOWN_VOLUME = { average: null, daysUsed: 0 };
+
+/** 複数銘柄の平均出来高を Map(ticker → { average, daysUsed }) で返す。キャッシュのみモードではネット取得しない */
+function getAverageVolumes(tickers, useCache = true, cacheOnly = false, onBatch) {
+  const values = collectByTicker(tickers, {
+    type: 'volume',
+    useCache: useCache,
+    cacheOnly: cacheOnly,
+    duration: CONFIG.CACHE_STOCK_DURATION,
+    // PC版（kabutan.jp/stock/...）は GAS からだと HTTP 403 になるため、業種一覧と同じスマホ版を使う
+    urlOf: (ticker) => 'https://s.kabutan.jp/stocks/' + encodeURIComponent(ticker) + '/historical_prices/daily/',
+    parse: (html) => {
+      const volumes = parseDailyVolumes(html);
+      return { average: computeAverageVolume(volumes, VOLUME_AVERAGE_DAYS), daysUsed: Math.min(volumes.length, VOLUME_AVERAGE_DAYS) };
+    },
+    shouldCache: (result) => result.average !== null,
+    onBatch: onBatch,
+  });
+  const results = new Map();
+  tickers.forEach((ticker) => results.set(ticker, values.get(ticker) || UNKNOWN_VOLUME));
+  return results;
+}
+
+/** 同時に取得する件数。株探への負荷と速度の兼ね合い */
+const FETCH_BATCH_SIZE = 10;
+
+/**
+ * 銘柄ごとのページを、キャッシュはまとめて読み、足りない分だけ FETCH_BATCH_SIZE 件ずつ同時に取得する。
+ * 1件ずつ順番に取ると約1,000件で15分以上かかるため。
+ * 戻り値: Map(ticker → parse の結果)。取得・解析できなかった銘柄は入らない。
+ * onBatch(done, total) はバッチごとに呼ぶ（進捗表示と時間予算の確認用）。
+ */
+function collectByTicker(tickers, options) {
   const cache = CacheService.getScriptCache();
-  const cacheKey = getCacheKey('volume', ticker);
+  const values = new Map();
+  const failures = options.failures || new Map();
+  const total = tickers.length;
+  for (let start = 0; start < total; start += FETCH_BATCH_SIZE) {
+    const chunk = tickers.slice(start, start + FETCH_BATCH_SIZE);
+    const keys = chunk.map((ticker) => getCacheKey(options.type, ticker));
 
-  if (useCache || cacheOnly) {
-    const cached = cache.get(cacheKey);
-    if (cached != null) {
-      return JSON.parse(cached);
+    if (options.useCache || options.cacheOnly) {
+      const cached = cache.getAll(keys);
+      chunk.forEach((ticker, i) => {
+        if (cached[keys[i]] != null) values.set(ticker, JSON.parse(cached[keys[i]]));
+      });
     }
-  }
-  // キャッシュのみモードではネット取得しない（出来高は不明として扱う）
-  if (cacheOnly) {
-    return { average: null, daysUsed: 0 };
-  }
 
-  const url = 'https://kabutan.jp/stock/kabuka?code=' + encodeURIComponent(ticker);
+    const missing = options.cacheOnly ? [] : chunk.filter((ticker) => !values.has(ticker));
+    if (missing.length > 0) {
+      const fetched = fetchAllWithUserAgent(missing.map(options.urlOf));
+      const toCache = {};
+      missing.forEach((ticker, i) => {
+        if (fetched[i].text == null) {
+          failures.set(ticker, fetched[i].reason);
+          return;
+        }
+        try {
+          const value = options.parse(fetched[i].text);
+          if (value == null) {
+            failures.set(ticker, '表なし');
+            return;
+          }
+          values.set(ticker, value);
+          if (!options.shouldCache || options.shouldCache(value)) {
+            toCache[getCacheKey(options.type, ticker)] = JSON.stringify(value);
+          }
+        } catch (e) {
+          failures.set(ticker, '解析エラー');
+          Logger.log(options.type + ' 解析エラー (' + ticker + '): ' + e.toString());
+        }
+      });
+      if (Object.keys(toCache).length > 0) cache.putAll(toCache, options.duration);
+    }
+
+    if (options.onBatch) options.onBatch(Math.min(start + FETCH_BATCH_SIZE, total), total);
+  }
+  return values;
+}
+
+/**
+ * 複数URLを同時に取得し、[{ text, reason }] を返す。失敗時は text: null で reason に理由（"HTTP 403" など）。
+ * fetchAll は1件でも通信エラーがあると全体が例外になるため、そのときだけ1件ずつ取り直す。
+ */
+function fetchAllWithUserAgent(urls) {
+  const requests = urls.map((url) => ({
+    url: url,
+    headers: { 'User-Agent': CONFIG.USER_AGENT },
+    muteHttpExceptions: true,
+  }));
   try {
-    const volumes = parseDailyVolumes(fetchWithUserAgent(url));
-    const average = computeAverageVolume(volumes, VOLUME_AVERAGE_DAYS);
-    const result = { average: average, daysUsed: Math.min(volumes.length, VOLUME_AVERAGE_DAYS) };
-    if (average !== null) {
-      cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
-    }
-    return result;
+    return UrlFetchApp.fetchAll(requests).map((response, i) => {
+      const code = response.getResponseCode();
+      if (code === 200) return { text: response.getContentText('utf-8'), reason: null };
+      Logger.log('HTTP ' + code + ': ' + urls[i]);
+      return { text: null, reason: 'HTTP ' + code };
+    });
   } catch (e) {
-    Logger.log('出来高取得エラー (' + ticker + '): ' + e.toString());
-    return { average: null, daysUsed: 0 };
+    Logger.log('まとめて取得に失敗したため1件ずつ取り直します: ' + e.toString());
+    return urls.map((url) => {
+      try {
+        return { text: fetchWithUserAgent(url), reason: null };
+      } catch (err) {
+        const match = String(err).match(/HTTP \d+/);
+        return { text: null, reason: match ? match[0] : '通信エラー' };
+      }
+    });
   }
 }
 
@@ -197,21 +298,168 @@ function applyVolumeFilter(stocks, settings, useCache = true, onProgress, cacheO
   const s = settings || DEFAULT_SETTINGS;
   const kept = [];
   const dropped = [];
-  (stocks || []).forEach((stock, index) => {
-    const result = getAverageVolume(stock.TICKER, useCache, cacheOnly);
+  const list = stocks || [];
+  const volumes = getAverageVolumes(list.map((stock) => stock.TICKER), useCache, cacheOnly, onProgress);
+  list.forEach((stock) => {
+    const result = volumes.get(stock.TICKER);
     stock.AVG_VOLUME = result.average;
     if (result.average !== null && result.average <= s.minAverageVolume) {
       dropped.push(stock.TICKER);
     } else {
       kept.push(stock);
     }
-    if (onProgress) onProgress(index + 1, stocks.length);
   });
   if (dropped.length > 0) {
     Logger.log('出来高フィルタで除外: ' + dropped.length + '件 (' + dropped.join(', ') + ')');
   }
   return kept;
 }
+
+/** 財務の判定結果は業績が日次で変わらないため長めに持つ（CacheService の上限は6時間） */
+const CACHE_FINANCE_DURATION = 21600;
+
+/** "1,234" "52*" "－" などを数値化する。読めなければ null */
+function parseFinanceNumber(text) {
+  const cleaned = removeHtmlTags(String(text || '')).replace(/&nbsp;/g, '').replace(/[,*\s円]/g, '');
+  if (!/^-?\d+(\.\d+)?$/.test(cleaned)) return null;
+  return Number(cleaned);
+}
+
+/**
+ * 財務ページの通期業績表（ヘッダーに「修正1株配」がある最初の表）を読む。
+ * PC版の行: <th scope="row"><span class="kubun1">I 予 </span>2027.03</th>
+ * スマホ版の行: <th class="sticky">予 2027.03 <span ...></span></th>
+ *     どちらも <td>売上高</td><td>営業益</td><td>経常益</td><td>最終益</td><td>1株益</td><td>1株配</td>... の順
+ * 戻り値: [{ period, isForecast, netIncome, eps, dps }]（ページ上の順＝古い順）
+ */
+function parseAnnualResults(html) {
+  const text = String(html || '');
+  const pcHeader = text.indexOf('data-help="修正1株配"');
+  const headerIndex = pcHeader !== -1 ? pcHeader : text.indexOf('修正<br>1株配');
+  if (headerIndex === -1) return [];
+  const tableEnd = text.indexOf('</table>', headerIndex);
+  const table = text.substring(headerIndex, tableEnd === -1 ? text.length : tableEnd);
+
+  const rows = [];
+  const trMatches = table.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  for (const tr of trMatches) {
+    const thMatch = tr.match(/<th (?:scope="row"|class="sticky")[^>]*>([\s\S]*?)<\/th>/);
+    if (!thMatch) continue;
+    const periodMatch = thMatch[1].match(/(\d{4}\.\d{2})/);
+    if (!periodMatch) continue;
+    const tds = tr.match(/<td[^>]*>[\s\S]*?<\/td>/g) || [];
+    if (tds.length < 6) continue;
+    rows.push({
+      period: periodMatch[1],
+      isForecast: thMatch[1].indexOf('予') !== -1,
+      netIncome: parseFinanceNumber(tds[3]),
+      eps: parseFinanceNumber(tds[4]),
+      dps: parseFinanceNumber(tds[5]),
+    });
+  }
+  return rows;
+}
+
+/**
+ * 配当の持続性を判定する。除外はせず、注意として出す理由の配列を返す。
+ * 下方修正の履歴は株探プレミアム限定のため、「今期予想が前期実績より減益か」で代用する。
+ */
+function evaluateDividendSafety(rows, settings) {
+  const s = settings || DEFAULT_SETTINGS;
+  const flags = [];
+  const actuals = (rows || []).filter((r) => !r.isForecast);
+  const forecasts = (rows || []).filter((r) => r.isForecast);
+  const forecast = forecasts.length > 0 ? forecasts[forecasts.length - 1] : null;
+  const lastActual = actuals.length > 0 ? actuals[actuals.length - 1] : null;
+  let payoutRatio = null;
+
+  if (forecast && forecast.eps !== null) {
+    if (forecast.eps <= 0) {
+      flags.push('予想赤字');
+    } else if (forecast.dps !== null) {
+      payoutRatio = Math.round(forecast.dps / forecast.eps * 1000) / 10;
+      if (payoutRatio > s.maxPayoutRatio) {
+        flags.push('配当性向 ' + payoutRatio + '%');
+      }
+    }
+  }
+
+  if (forecast && lastActual && forecast.dps !== null && lastActual.dps !== null
+      && forecast.dps < lastActual.dps) {
+    flags.push('減配予想');
+  }
+
+  for (let i = 1; i < actuals.length; i++) {
+    if (actuals[i].dps !== null && actuals[i - 1].dps !== null && actuals[i].dps < actuals[i - 1].dps) {
+      flags.push(actuals[i].period + ' 減配');
+    }
+  }
+
+  if (forecast && lastActual && forecast.netIncome !== null && lastActual.netIncome !== null
+      && lastActual.netIncome > 0 && forecast.netIncome < lastActual.netIncome) {
+    const change = Math.round((forecast.netIncome / lastActual.netIncome - 1) * 100);
+    flags.push('減益予想 ' + change + '%');
+  }
+
+  return { payoutRatio: payoutRatio, flags: flags };
+}
+
+/**
+ * 銘柄の配当の持続性を取得する。戻り値: { payoutRatio, flags[] }
+ * パース後の判定材料（業績行）だけを銘柄単位で6時間キャッシュする。
+ * 判定は settings に依存するため、キャッシュからでも毎回やり直す。
+ * clearAllCache の対象外（キーを列挙できないため）。
+ */
+function getDividendSafety(ticker, settings, useCache = true, cacheOnly = false) {
+  return getDividendSafeties([ticker], settings, useCache, cacheOnly).get(ticker);
+}
+
+/** 複数銘柄の配当判定を Map(ticker → { payoutRatio, flags[] }) で返す */
+function getDividendSafeties(tickers, settings, useCache = true, cacheOnly = false, onBatch) {
+  const failures = new Map();
+  const rowsByTicker = collectByTicker(tickers, {
+    failures: failures,
+    type: 'finance',
+    useCache: useCache,
+    cacheOnly: cacheOnly,
+    duration: CACHE_FINANCE_DURATION,
+    urlOf: (ticker) => 'https://s.kabutan.jp/stocks/' + encodeURIComponent(ticker) + '/finance/',
+    parse: (html) => {
+      const rows = parseAnnualResults(html);
+      return rows.length > 0 ? rows : null;
+    },
+    onBatch: onBatch,
+  });
+  const results = new Map();
+  tickers.forEach((ticker) => {
+    const rows = rowsByTicker.get(ticker);
+    if (rows) {
+      results.set(ticker, evaluateDividendSafety(rows, settings));
+      return;
+    }
+    const flag = cacheOnly ? '財務データ未取得' : '財務取得失敗（' + (failures.get(ticker) || '不明') + '）';
+    results.set(ticker, { payoutRatio: null, flags: [flag] });
+  });
+  return results;
+}
+
+/** 候補全件に予想配当性向と注意を付ける（除外はしない） */
+function applyDividendSafety(stocks, settings, useCache = true, onProgress, cacheOnly = false) {
+  const list = stocks || [];
+  const safeties = getDividendSafeties(list.map((stock) => stock.TICKER), settings, useCache, cacheOnly, onProgress);
+  list.forEach((stock) => {
+    const result = safeties.get(stock.TICKER);
+    stock.PAYOUT_RATIO = result.payoutRatio;
+    stock.NOTES = (stock.IS_FINANCIAL ? [FINANCIAL_NOTE] : []).concat(result.flags);
+  });
+  return stocks;
+}
+
+/**
+ * 業種一覧ページのキャッシュ種別。キャッシュには読み取り済みの値を入れるため、
+ * 読み取り方を変えたら番号を上げて古いキャッシュを使わないようにする（v2: PER のカンマ修正）
+ */
+const STOCKS_CACHE_TYPE = 'stocks_v2';
 
 /**
  * キャッシュキーを生成
@@ -260,8 +508,8 @@ function removeHtmlTags(text) {
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('株価取得')
-    .addItem('銘柄データ更新', 'create_pickup_stocks')
-    .addItem('キャッシュで再判定（取得しない）', 'create_pickup_stocks_from_cache')
+    .addItem('銘柄データ更新', 'startPickup')
+    .addItem('キャッシュで再判定（取得しない）', 'startPickupFromCache')
     .addItem('settingsシートを開く', 'openSettingsSheet')
     .addSeparator()
     .addItem('キャッシュクリア', 'clearAllCache')
@@ -280,7 +528,7 @@ function clearAllCache() {
     // 取得範囲（1ページ〜MAX_PAGES未満）と揃えて全ページ分を削除する
     for (const industry of iList) {
       for (let p = 1; p < CONFIG.MAX_PAGES; p++) {
-        keys.push(getCacheKey('stocks', encodeURIComponent(industry.CODE), p));
+        keys.push(getCacheKey(STOCKS_CACHE_TYPE, encodeURIComponent(industry.CODE), p));
       }
     }
 
@@ -309,8 +557,31 @@ function openSettingsSheet() {
     + getMaxStockPrice(getSettings(ss)).toLocaleString() + '円）', 'settings', 5);
 }
 
+/**
+ * メニュー用。サイドバーを開き、サイドバー側から runPickup を起動させる。
+ * メニューから直接 runPickup を呼ぶと、終わるまでサイドバーを描画できないため。
+ */
+function startPickup() {
+  openProgressSidebar(false);
+}
+
+function startPickupFromCache() {
+  openProgressSidebar(true);
+}
+
+function openProgressSidebar(cacheOnly) {
+  const template = HtmlService.createTemplateFromFile('progress');
+  template.cacheOnly = cacheOnly;
+  template.title = cacheOnly ? 'キャッシュで再判定' : '銘柄データ更新';
+  SpreadsheetApp.getUi().showSidebar(template.evaluate().setTitle('銘柄スクリーニング'));
+}
+
+/**
+ * スクリプトエディタやトリガーから実行する用（進捗はサイドバーが無ければ誰も読まない）。
+ * 時間予算で打ち切られた場合は { done: false } が返るので、もう一度実行すれば続きから進む。
+ */
 function create_pickup_stocks(){
-  runPickup(false);
+  return runPickup(false);
 }
 
 /**
@@ -319,10 +590,54 @@ function create_pickup_stocks(){
  * キャッシュは最大1時間で消えるため、それを過ぎるとデータなしとして案内する。
  */
 function create_pickup_stocks_from_cache(){
-  runPickup(true);
+  return runPickup(true);
 }
 
-function runPickup(cacheOnly){
+/**
+ * 候補を作って pickup に書く。戻り値は結果の要約（サイドバーの完了表示に使う）。
+ * 候補0件などの終了理由も例外ではなく要約として返す。書き込み失敗は例外で返す。
+ *
+ * GAS の1回の実行は6分まで。時間予算を超えたら途中で打ち切り { done: false } を返す。
+ * 取得済みのページ・出来高・財務はキャッシュに残っているため、呼び出し側（サイドバー）が
+ * もう一度呼べば続きから進む。打ち切った回は pickup と history を書き換えない。
+ * 戻り値: { done: boolean, message: string }
+ */
+function runPickup(cacheOnly, budgetMs){
+  // サイドバーとの通信が切れてもサーバー側の実行は続くことがある。
+  // そこへ再試行が重なって pickup / history を二重に書かないよう、同時に1つだけ動かす。
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    return { done: false, busy: true, message: '前の実行がまだ動いています。終わるのを待っています' };
+  }
+  const startedAt = Date.now();
+  const budget = (typeof budgetMs === 'number') ? budgetMs : TIME_BUDGET_MS;
+  const checkBudget = () => {
+    if (Date.now() - startedAt > budget) throw new TimeBudgetExceeded();
+  };
+  try {
+    return { done: true, message: runPickupCore(cacheOnly, checkBudget, startedAt) };
+  } catch (e) {
+    if (!(e instanceof TimeBudgetExceeded)) throw e;
+    const message = '一旦区切りました。取得済みの分はキャッシュに残っており、続きから再開します';
+    Logger.log(message + '（経過 ' + Math.round((Date.now() - startedAt) / 1000) + '秒）');
+    writeProgress({ message: message, percent: 0, done: false });
+    return { done: false, message: message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 1回の実行で使う時間の上限。GAS の6分制限より、サイドバーからの呼び出しが
+ * 長いと通信が切れる（NetworkError: HTTP 0）方が先に起きたため、短く刻む。
+ */
+const TIME_BUDGET_MS = 150000;
+
+function TimeBudgetExceeded() {
+  this.name = 'TimeBudgetExceeded';
+}
+
+function runPickupCore(cacheOnly, checkBudget, startedAt){
 
   // キャッシュを有効化（開発時はfalseに設定可能）
   const USE_CACHE = true;
@@ -332,16 +647,12 @@ function runPickup(cacheOnly){
   Logger.log('適用設定: ' + JSON.stringify(settings)
     + ' / 株価上限の目安: ' + getMaxStockPrice(settings) + '円');
   
-  // プログレスバー用のHTMLを表示
-  showProgress('データ取得中...', 0);
-  
+  showProgress('開始しています', 0);
+
   const iList = create_industrycodelist(USE_CACHE)
 
   if (iList == null || iList.length === 0){
-    const errorMsg = "業種リスト取得エラー: データを取得できませんでした";
-    Logger.log(errorMsg);
-    SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, 'エラー', 10);
-    return;
+    return finishProgress("業種リスト取得エラー: データを取得できませんでした");
   }
 
   let stockTable = []
@@ -353,6 +664,7 @@ function runPickup(cacheOnly){
 
       for ( let pageNo = 1; pageNo < CONFIG.MAX_PAGES; pageNo++ ){
 
+        checkBudget();
         const result = cacheOnly
           ? getCachedStocksByPage(industry.CODE, pageNo, settings)
           : get_stocks_by_page(industry.CODE, pageNo, USE_CACHE, settings)
@@ -360,25 +672,26 @@ function runPickup(cacheOnly){
         if (result.cacheMiss) cacheMissPages++;
         if ( result.done ) break  // そのページにデータなし = 最終ページ超え
 
+        result.stocks.forEach((stock) => {
+          stock.INDUSTRY = industry.NAME;
+          stock.IS_FINANCIAL = FINANCIAL_INDUSTRY_CODES.indexOf(industry.CODE) !== -1;
+        });
         stockTable = stockTable.concat(result.stocks)
       }
 
       // 進捗を更新
       processedIndustries++;
-      const progress = Math.round((processedIndustries / totalIndustries) * 100);
-      showProgress('業種 ' + processedIndustries + '/' + totalIndustries + ' 処理中...', progress);
+      showProgress(stageMessage(1, '業種一覧を取得中', processedIndustries, totalIndustries, '業種'),
+        stagePercent(0, 40, processedIndustries, totalIndustries));
   }
 
   Logger.log('取得した銘柄数: ' + stockTable.length
     + (cacheOnly ? '（キャッシュのみ、ミス ' + cacheMissPages + 'ページ）' : ''));
 
   if (stockTable.length === 0) {
-    const errorMsg = cacheOnly
+    return finishProgress(cacheOnly
       ? "キャッシュにデータがありません。「銘柄データ更新」を先に実行してください（キャッシュは最大1時間で消えます）"
-      : "条件に合う銘柄が見つかりませんでした";
-    Logger.log(errorMsg);
-    SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, '警告', 10);
-    return;
+      : "条件に合う銘柄が見つかりませんでした");
   }
   if (cacheOnly && cacheMissPages > 0) {
     Logger.log('注意: キャッシュ切れのページが ' + cacheMissPages + ' 件あり、結果が一部欠けている可能性があります');
@@ -386,19 +699,25 @@ function runPickup(cacheOnly){
 
   // 第1.5段階: 25日平均出来高による流動性フィルタ（候補だけ個別取得する）
   const beforeVolume = stockTable.length;
+  checkBudget();
   stockTable = applyVolumeFilter(stockTable, settings, USE_CACHE, (done, total) => {
-    showProgress('出来高確認中 ' + done + '/' + total + '...', 90);
+    showProgress(stageMessage(2, '出来高を確認中', done, total, '銘柄'), stagePercent(40, 80, done, total));
+    checkBudget();
   }, cacheOnly);
   Logger.log('出来高フィルタ: ' + beforeVolume + '件 → ' + stockTable.length + '件');
 
   if (stockTable.length === 0) {
-    const errorMsg = "出来高条件に合う銘柄が見つかりませんでした";
-    Logger.log(errorMsg);
-    SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, '警告', 10);
-    return;
+    return finishProgress("出来高条件に合う銘柄が見つかりませんでした");
   }
 
-  showProgress('スプレッドシートに書き込み中...', 95);
+  // 配当の持続性チェック（候補が一番少ない時点で財務ページを取得。落とさず注意に書く）
+  applyDividendSafety(stockTable, settings, USE_CACHE, (done, total) => {
+    showProgress(stageMessage(3, '配当を確認中', done, total, '銘柄'), stagePercent(80, 95, done, total));
+    checkBudget();
+  }, cacheOnly);
+  Logger.log('ここまでの経過時間: ' + Math.round((Date.now() - startedAt) / 1000) + '秒');
+
+  showProgress('pickup シートに書き込み中', 95);
 
   // 割安な順（ミックス係数の小さい順）。同点はコード順（英字付きコードでも崩れないよう文字列比較）
   stockTable.sort((a, b) => (a.MIX - b.MIX) || String(a.TICKER).localeCompare(String(b.TICKER)));
@@ -416,13 +735,13 @@ function runPickup(cacheOnly){
   Logger.log('出力シート名: ' + sheet.getName());
 
   // ヘッダーとデータを配列にまとめる
-  let header = ['コード','名称','株価','前日比','騰落率','PER','PBR','配当利回','ミックス係数','購入金額（単元）','出来高（25日平均）']
+  let header = ['コード','名称','業種','株価','前日比','騰落率','PER','PBR','配当利回','ミックス係数','購入金額（単元）','出来高（25日平均）','予想配当性向','注意']
   let allData = [header]
 
   for( let stock of stockTable ){
-    const rowData = [stock.TICKER, stock.NAME, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER, stock.PBR, stock.DPS,
-      stock.MIX, Number(stock.PRICE) * settings.unitShares,
-      (stock.AVG_VOLUME === null || stock.AVG_VOLUME === undefined) ? '不明' : stock.AVG_VOLUME]
+    const rowData = [stock.TICKER, stock.NAME, stock.INDUSTRY, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER, stock.PBR, stock.DPS,
+      stock.MIX, Number(stock.PRICE) * settings.unitShares, formatOrUnknown(stock.AVG_VOLUME),
+      formatOrUnknown(stock.PAYOUT_RATIO), (stock.NOTES || []).join(' / ')]
     allData.push(rowData)
   }
 
@@ -441,8 +760,14 @@ function runPickup(cacheOnly){
       // コード列（A列）を右詰めに設定
       sheet.getRange(1, 1, allData.length, 1).setHorizontalAlignment('right');
       
-      // 前日比（D列）と騰落率（E列）を右詰めに設定
-      sheet.getRange(1, 4, allData.length, 2).setHorizontalAlignment('right');
+      // 前日比と騰落率を右詰めに設定
+      sheet.getRange(1, header.indexOf('前日比') + 1, allData.length, 2).setHorizontalAlignment('right');
+
+      // シートに残った書式（通貨など）でミックス係数が「¥1」と丸まって見えたため、数値列の書式を毎回決める
+      const numberFormats = { 'ミックス係数': '0.00', '購入金額（単元）': '#,##0', '出来高（25日平均）': '#,##0', '予想配当性向': '0.0' };
+      Object.keys(numberFormats).forEach((name) => {
+        sheet.getRange(2, header.indexOf(name) + 1, stockTable.length, 1).setNumberFormat(numberFormats[name]);
+      });
       
       // 名称列（B列）にYahoo!ファイナンスへのリンクを一括設定する
       const nameFormulas = stockTable.map((stock) => [createYahooFinanceFormula(stock.TICKER, stock.NAME)]);
@@ -455,21 +780,57 @@ function runPickup(cacheOnly){
   } catch(e) {
     const errorMsg = 'スプレッドシート書き込みエラー: ' + e.toString();
     Logger.log(errorMsg);
-    SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, 'エラー', 10);
+    finishProgress(errorMsg);
     throw e;
   }
   
-  // 最終更新日時を記録（ヘッダーが K 列まで伸びたため M 列へ）
-  const lastUpdateCell = sheet.getRange('M1');
+  // 最終更新日時はヘッダーの右に1列空けて置く
+  const lastUpdateCell = sheet.getRange(1, header.length + 2);
   const now = new Date();
   const formattedDate = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
   lastUpdateCell.setValue('最終更新: ' + formattedDate);
   lastUpdateCell.setFontSize(9);
   lastUpdateCell.setFontColor('#666666');
-  
-  // 完了メッセージを表示
-  closeProgress();
 
+  // 閾値の試行（キャッシュで再判定）は混ぜず、通常実行の候補だけを記録する
+  if (!cacheOnly) {
+    try {
+      appendHistory(ss, stockTable, settings, formattedDate);
+    } catch (e) {
+      Logger.log('history 追記エラー: ' + e.toString());
+    }
+  }
+  
+  const flagged = stockTable.filter((stock) => (stock.NOTES || []).length > 0).length;
+  return finishProgress('候補 ' + stockTable.length + '件（うち注意あり ' + flagged + '件）を pickup に出力しました');
+}
+
+const HISTORY_HEADER = ['実行日時','コード','名称','業種','株価','PER','PBR','配当利回','ミックス係数','出来高（25日平均）','予想配当性向','注意','適用設定'];
+
+/**
+ * 候補を history シートの末尾に追記する（後で成績を比べる効果測定用）。
+ * 適用設定を JSON で残し、どの閾値で選んだ候補かを後から区別できるようにする。
+ */
+function appendHistory(ss, stocks, settings, runAt) {
+  if (!stocks || stocks.length === 0) return;
+  let sheet = ss.getSheetByName(HISTORY_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(HISTORY_SHEET_NAME);
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, HISTORY_HEADER.length).setValues([HISTORY_HEADER]);
+    sheet.setFrozenRows(1);
+  }
+  const settingsJson = JSON.stringify(settings);
+  const rows = stocks.map((stock) => [runAt, stock.TICKER, stock.NAME, stock.INDUSTRY, stock.PRICE,
+    stock.PER, stock.PBR, stock.DPS, stock.MIX, formatOrUnknown(stock.AVG_VOLUME),
+    formatOrUnknown(stock.PAYOUT_RATIO), (stock.NOTES || []).join(' / '), settingsJson]);
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HISTORY_HEADER.length).setValues(rows);
+}
+
+/** 取得できなかった値（null/undefined）をシート上で「不明」と表示する */
+function formatOrUnknown(value) {
+  return (value === null || value === undefined) ? '不明' : value;
 }
 
 /**
@@ -482,18 +843,50 @@ function createYahooFinanceFormula(ticker, name) {
   return '=HYPERLINK("' + url + '","' + escapedName + '")';
 }
 
-/**
- * 進捗をトースト通知で表示
- */
-function showProgress(message, percent) {
-  SpreadsheetApp.getActiveSpreadsheet().toast(message + ' (' + percent + '%)', '銘柄データ取得中', 3);
+const PROGRESS_STAGE_COUNT = 3;
+
+/** 例: "【2/3】出来高を確認中: 37 / 493 銘柄" */
+function stageMessage(stage, label, done, total, unit) {
+  return '【' + stage + '/' + PROGRESS_STAGE_COUNT + '】' + label + ': '
+    + done.toLocaleString() + ' / ' + total.toLocaleString() + ' ' + unit;
 }
 
+/** 段階ごとに割り当てたバーの範囲 [from, to] の中で進める */
+function stagePercent(from, to, done, total) {
+  if (!total) return to;
+  return Math.round(from + (to - from) * done / total);
+}
+
+const PROGRESS_CACHE_KEY = 'pickup_progress';
+const PROGRESS_CACHE_DURATION = 600;
+
 /**
- * 完了通知
+ * 進捗をユーザー単位のキャッシュに書く。サイドバーが getProgress で読みに来る。
+ * 進捗の書き込み失敗で本処理を止めないよう、例外は握りつぶしてログだけ残す。
  */
-function closeProgress() {
-  SpreadsheetApp.getActiveSpreadsheet().toast('データ取得が完了しました', '完了', 5);
+function showProgress(message, percent) {
+  writeProgress({ message: message, percent: percent, done: false });
+}
+
+/** 終了を記録し、同じメッセージを返す（runPickup の戻り値にそのまま使う） */
+function finishProgress(message) {
+  Logger.log(message);
+  writeProgress({ message: message, percent: 100, done: true });
+  return message;
+}
+
+function writeProgress(state) {
+  try {
+    CacheService.getUserCache().put(PROGRESS_CACHE_KEY, JSON.stringify(state), PROGRESS_CACHE_DURATION);
+  } catch (e) {
+    Logger.log('進捗の書き込みエラー: ' + e.toString());
+  }
+}
+
+/** サイドバーからポーリングで呼ばれる */
+function getProgress() {
+  const cached = CacheService.getUserCache().get(PROGRESS_CACHE_KEY);
+  return cached ? JSON.parse(cached) : null;
 }
 
 /**
@@ -565,7 +958,7 @@ function get_stocks_by_page(industryCode, pageNo, useCache = true, settings){
 
   const s = settings || DEFAULT_SETTINGS;
   const cache = CacheService.getScriptCache();
-  const cacheKey = getCacheKey('stocks', encodeURIComponent(industryCode), pageNo);
+  const cacheKey = getCacheKey(STOCKS_CACHE_TYPE, encodeURIComponent(industryCode), pageNo);
 
   // キャッシュから生データを取得を試みる
   if (useCache) {
@@ -631,7 +1024,7 @@ function get_stocks_by_page(industryCode, pageNo, useCache = true, settings){
 function getCachedStocksByPage(industryCode, pageNo, settings) {
   const s = settings || DEFAULT_SETTINGS;
   const cache = CacheService.getScriptCache();
-  const cacheKey = getCacheKey('stocks', encodeURIComponent(industryCode), pageNo);
+  const cacheKey = getCacheKey(STOCKS_CACHE_TYPE, encodeURIComponent(industryCode), pageNo);
   const cached = cache.get(cacheKey);
   if (cached == null) {
     return { stocks: [], done: true, cacheMiss: true };
@@ -690,16 +1083,16 @@ function get_stock_data(row) {
     res.CHANGE_RATE = zeroRateMatch ? zeroRateMatch[1] + '%' : '0%';
   }
 
-  // PER（"倍"を除去、"ー"は0扱い）
-  const perText = removeHtmlTags(tdMatches[2]).replace(/倍/g, '').trim();
+  // PER（"倍"と桁区切りを除去、"ー"は0扱い）。parseFloat("1,052.5") は 1 になるため、カンマは必ず先に消す
+  const perText = removeHtmlTags(tdMatches[2]).replace(/[倍,]/g, '').trim();
   res.PER = (perText === 'ー' || perText === '') ? 0 : parseFloat(perText);
 
   // PBR
-  const pbrText = removeHtmlTags(tdMatches[3]).replace(/倍/g, '').trim();
+  const pbrText = removeHtmlTags(tdMatches[3]).replace(/[倍,]/g, '').trim();
   res.PBR = (pbrText === 'ー' || pbrText === '') ? 0 : parseFloat(pbrText);
 
   // 配当利回り（"%"を除去）
-  const dpsText = removeHtmlTags(tdMatches[4]).replace(/%/g, '').trim();
+  const dpsText = removeHtmlTags(tdMatches[4]).replace(/[%,]/g, '').trim();
   res.DPS = (dpsText === 'ー' || dpsText === '') ? 0 : parseFloat(dpsText);
 
   // グレアムのミックス係数（PER・PBRのどちらかが欠損した場合は判定不能として null）

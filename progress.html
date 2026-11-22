@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: Arial, 'Noto Sans JP', sans-serif; font-size: 13px; margin: 12px; color: #202124; }
+    h2 { font-size: 14px; margin: 0 0 12px; }
+    .bar { width: 100%; height: 14px; background: #e8eaed; border-radius: 7px; overflow: hidden; }
+    .fill { height: 100%; width: 0%; background: #1a73e8; transition: width 0.4s ease; }
+    .fill.done { background: #188038; }
+    .fill.error { background: #d93025; }
+    .row { display: flex; justify-content: space-between; margin-top: 6px; color: #5f6368; font-size: 12px; }
+    #message { margin-top: 12px; line-height: 1.5; }
+    button { margin-top: 16px; padding: 6px 16px; display: none; }
+  </style>
+</head>
+<body>
+  <h2><?= title ?></h2>
+  <div class="bar"><div class="fill" id="fill"></div></div>
+  <div class="row"><span id="percent">0%</span><span id="elapsed">0秒</span></div>
+  <div id="message">開始しています...</div>
+  <button id="close" onclick="google.script.host.close()">閉じる</button>
+
+  <script>
+    var cacheOnly = <?!= JSON.stringify(cacheOnly) ?>;
+    var startedAt = Date.now();
+    var finished = false;
+    var POLL_MS = 1500;
+
+    function render(percent, message) {
+      document.getElementById('fill').style.width = percent + '%';
+      document.getElementById('percent').textContent = percent + '%';
+      if (message) document.getElementById('message').textContent = message;
+    }
+
+    function finish(message, isError) {
+      finished = true;
+      var fill = document.getElementById('fill');
+      fill.classList.add(isError ? 'error' : 'done');
+      render(100, message);
+      document.getElementById('close').style.display = 'inline-block';
+    }
+
+    function poll() {
+      if (finished) return;
+      google.script.run
+        .withSuccessHandler(function (state) {
+          if (!finished && state && !state.done) {
+            render(state.percent, (round > 1 ? '（' + round + '回目）' : '') + state.message);
+          }
+          if (!finished) setTimeout(poll, POLL_MS);
+        })
+        .withFailureHandler(function () {
+          if (!finished) setTimeout(poll, POLL_MS);
+        })
+        .getProgress();
+    }
+
+    setInterval(function () {
+      if (finished) return;
+      document.getElementById('elapsed').textContent = Math.round((Date.now() - startedAt) / 1000) + '秒';
+    }, 1000);
+
+    // サーバー側は2分半ごとに区切って { done: false } を返すので、続きを新しい実行として呼び直す。
+    // 取得済みの分はキャッシュに残るので、回を重ねるごとに先へ進む。
+    // 通信エラー（NetworkError）は進み具合が失われないため、待ってから再試行する。
+    // 前の実行が残っている間（busy）は、終わるまで待つ。
+    var MAX_ROUNDS = 20;
+    var MAX_NETWORK_RETRIES = 3;
+    var MAX_BUSY_WAITS = 30;
+    var RETRY_WAIT_MS = 10000;
+    var round = 1;
+    var networkRetries = 0;
+    var busyWaits = 0;
+
+    function showMessage(text) {
+      document.getElementById('message').textContent = text;
+    }
+
+    function isNetworkError(error) {
+      var text = String(error && error.message ? error.message : error);
+      return text.indexOf('NetworkError') !== -1 || text.indexOf('HTTP 0') !== -1;
+    }
+
+    function run() {
+      google.script.run
+        .withSuccessHandler(function (result) {
+          networkRetries = 0;
+          if (result && result.busy) {
+            if (++busyWaits > MAX_BUSY_WAITS) {
+              finish('前の実行が終わりませんでした。数分待ってからもう一度実行してください', true);
+              return;
+            }
+            showMessage(result.message);
+            setTimeout(run, RETRY_WAIT_MS);
+            return;
+          }
+          busyWaits = 0;
+          if (result && result.done === false) {
+            if (round >= MAX_ROUNDS) {
+              finish('規定回数（' + MAX_ROUNDS + '回）続けても終わりませんでした。少し待ってからもう一度実行してください', true);
+              return;
+            }
+            round++;
+            showMessage('続きを実行しています（' + round + '回目）');
+            run();
+            return;
+          }
+          finish((result && result.message) || '完了しました', false);
+        })
+        .withFailureHandler(function (error) {
+          var text = error && error.message ? error.message : String(error);
+          if (isNetworkError(error) && networkRetries < MAX_NETWORK_RETRIES) {
+            networkRetries++;
+            showMessage('通信が切れたため再接続します（' + networkRetries + '/' + MAX_NETWORK_RETRIES + '）。取得済みの分は失われません');
+            setTimeout(run, RETRY_WAIT_MS);
+            return;
+          }
+          finish('エラーで止まりました: ' + text, true);
+        })
+        .runPickup(cacheOnly);
+    }
+
+    run();
+    setTimeout(poll, POLL_MS);
+  </script>
+</body>
+</html>
