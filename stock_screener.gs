@@ -1,5 +1,5 @@
 /**
- * 設定定数
+ * 設定定数（閾値の正は settings シート。ここはシートが無い／壊れたときの既定値）
  */
 const CONFIG = {
   MAX_PAGES: 99,
@@ -11,6 +11,207 @@ const CONFIG = {
   CACHE_CLEAR_MAX_INDUSTRY: 50,
   CACHE_BATCH_SIZE: 100
 };
+
+const SETTINGS_SHEET_NAME = 'settings';
+const OUTPUT_SHEET_NAME = 'pickup';
+
+/**
+ * settings シートの定義。キーはコード内での名前、値は C 列でユーザーが編集する。
+ * stage2 系は第2段階スクリーニング（個別財務ページ取得）導入時に使う予約項目で、
+ * 現時点では判定に使わない。シート上の説明にもその旨を書く。
+ */
+const SETTINGS_DEFINITIONS = [
+  { key: 'maxBudgetPerStock', label: '1銘柄の予算上限', value: 300000, description: '円。株価×単元株数がこれを超える銘柄（値がさ株）を除外する' },
+  { key: 'unitShares', label: '単元株数', value: 100, description: '株。通常は100。予算判定と購入金額の計算に使う' },
+  { key: 'grahamMixThreshold', label: 'グレアム・ミックス係数の上限', value: CONFIG.GRAHAM_MIX_THRESHOLD, description: 'PER×PBR がこれ未満を割安とする（本家グレアム基準は22.5、現行は厳しめの11）' },
+  { key: 'dividendYieldThreshold', label: '配当利回りの下限', value: CONFIG.DIVIDEND_YIELD_THRESHOLD, description: '％。これ以上を対象とする' },
+  { key: 'minAverageVolume', label: '25日平均出来高の下限', value: 10000, description: '株。直近25営業日の平均出来高がこれ以下の銘柄を除外する（流動性フィルタ）' },
+  { key: 'minRoe', label: '【第2段階・予約】ROE の下限', value: 8, description: '％。今の稼ぐ力の判定用。個別財務取得を入れるまでは未適用' },
+  { key: 'minOperatingMargin', label: '【第2段階・予約】営業利益率の下限', value: 5, description: '％。業種差が大きいため最終的には業種内比較にする想定。未適用' },
+  { key: 'minEquityRatio', label: '【第2段階・予約】自己資本比率の下限', value: 40, description: '％。金融業など業種によっては例外扱いにする想定。未適用' },
+  { key: 'maxPayoutRatio', label: '【第2段階・予約】配当性向の上限', value: 70, description: '％。高利回りでも稼ぎ以上に配っていないかの判定用。未適用' },
+];
+
+const DEFAULT_SETTINGS = SETTINGS_DEFINITIONS.reduce((acc, def) => {
+  acc[def.key] = def.value;
+  return acc;
+}, {});
+
+/**
+ * settings シートが無ければ作り、不足している項目行だけを末尾に足す。
+ * 既存の値（C列）は絶対に上書きしない。
+ */
+function ensureSettingsSheet(ss) {
+  const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = spreadsheet.getSheetByName(SETTINGS_SHEET_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(SETTINGS_SHEET_NAME);
+  }
+
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, 4).setValues([['キー', '設定名', '値', '説明']]);
+    sheet.setFrozenRows(1);
+  }
+
+  const lastRow = sheet.getLastRow();
+  const knownKeys = new Set();
+  if (lastRow >= 2) {
+    sheet.getRange(2, 1, lastRow - 1, 1).getValues()
+      .forEach((row) => { if (row[0]) knownKeys.add(String(row[0])); });
+  }
+
+  const missing = SETTINGS_DEFINITIONS.filter((def) => !knownKeys.has(def.key));
+  if (missing.length > 0) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, missing.length, 4).setValues(
+      missing.map((def) => [def.key, def.label, def.value, def.description])
+    );
+  }
+  return sheet;
+}
+
+/**
+ * settings シートから設定を読む。読めない／0以下・数値でない値は既定値に倒す
+ * （予算が NaN になると全銘柄が黙って除外される事故を防ぐため）。
+ */
+function getSettings(ss) {
+  const settings = Object.assign({}, DEFAULT_SETTINGS);
+  try {
+    const sheet = ensureSettingsSheet(ss);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return settings;
+
+    const rows = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+    for (const def of SETTINGS_DEFINITIONS) {
+      const row = rows.find((r) => String(r[0]) === def.key);
+      if (!row) continue;
+      const value = Number(row[2]);
+      if (Number.isFinite(value) && value > 0) {
+        settings[def.key] = value;
+      } else {
+        Logger.log('settings の値が不正なため既定値を使います: ' + def.key + ' = ' + row[2]);
+      }
+    }
+  } catch (e) {
+    Logger.log('settings 読み込みエラー（既定値を使用）: ' + e.toString());
+  }
+  settings.unitShares = Math.max(1, Math.round(settings.unitShares));
+  return settings;
+}
+
+/** 予算上限から逆算した株価の上限（円） */
+function getMaxStockPrice(settings) {
+  return Math.floor(settings.maxBudgetPerStock / settings.unitShares);
+}
+
+/**
+ * 第1段階の合否判定。PER/PBR 欠損（MIX=null）は判定不能として除外する。
+ */
+function passesScreening(stock, settings) {
+  const s = settings || DEFAULT_SETTINGS;
+  const price = Number(stock.PRICE);
+  return stock.MIX !== null
+    && stock.MIX < s.grahamMixThreshold
+    && stock.DPS >= s.dividendYieldThreshold
+    && Number.isFinite(price) && price > 0
+    && price * s.unitShares <= s.maxBudgetPerStock;
+}
+
+function applyScreening(stocks, settings) {
+  return (stocks || []).filter((stock) => passesScreening(stock, settings));
+}
+
+/** 出来高の平均を取る営業日数と、平均として認める最低日数 */
+const VOLUME_AVERAGE_DAYS = 25;
+const VOLUME_MIN_DAYS = 5;
+
+/**
+ * 時系列ページのHTMLから日足の売買高を新しい順に抽出する。
+ * 株探の日足行: <tr><th scope="row"><time datetime="...">YY/MM/DD</time></th>
+ *   <td>始値</td>...<td>売買高</td></tr>（最終 td が売買高）
+ */
+function parseDailyVolumes(html) {
+  const volumes = [];
+  const trMatches = String(html || '').match(/<tr>[\s\S]*?<\/tr>/g) || [];
+  for (const row of trMatches) {
+    if (!/<time\s+datetime=/.test(row)) continue;
+    const tdMatches = row.match(/<td>([\s\S]*?)<\/td>/g);
+    if (!tdMatches || tdMatches.length < 7) continue;
+    const volumeText = removeHtmlTags(tdMatches[tdMatches.length - 1]).replace(/,/g, '').trim();
+    if (!/^\d+$/.test(volumeText)) continue;
+    volumes.push(Number(volumeText));
+  }
+  return volumes;
+}
+
+/** 売買高リストの先頭 days 件の平均。最低日数に満たなければ null（不明） */
+function computeAverageVolume(volumes, days) {
+  const target = (volumes || []).slice(0, days || VOLUME_AVERAGE_DAYS);
+  if (target.length < VOLUME_MIN_DAYS) return null;
+  const sum = target.reduce((acc, v) => acc + v, 0);
+  return Math.round(sum / target.length);
+}
+
+/**
+ * 銘柄の直近25営業日の平均出来高を取得する。戻り値: { average, daysUsed }
+ * 取得失敗・日数不足のときは average: null（不明）。
+ * キャッシュは銘柄単位で1時間。clearAllCache の対象外（GASでは全キー列挙が
+ * できないため）。実害は最大1時間古い出来高で判定すること。
+ */
+function getAverageVolume(ticker, useCache = true, cacheOnly = false) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = getCacheKey('volume', ticker);
+
+  if (useCache || cacheOnly) {
+    const cached = cache.get(cacheKey);
+    if (cached != null) {
+      return JSON.parse(cached);
+    }
+  }
+  // キャッシュのみモードではネット取得しない（出来高は不明として扱う）
+  if (cacheOnly) {
+    return { average: null, daysUsed: 0 };
+  }
+
+  const url = 'https://kabutan.jp/stock/kabuka?code=' + encodeURIComponent(ticker);
+  try {
+    const volumes = parseDailyVolumes(fetchWithUserAgent(url));
+    const average = computeAverageVolume(volumes, VOLUME_AVERAGE_DAYS);
+    const result = { average: average, daysUsed: Math.min(volumes.length, VOLUME_AVERAGE_DAYS) };
+    if (average !== null) {
+      cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
+    }
+    return result;
+  } catch (e) {
+    Logger.log('出来高取得エラー (' + ticker + '): ' + e.toString());
+    return { average: null, daysUsed: 0 };
+  }
+}
+
+/**
+ * 第1.5段階: 平均出来高による流動性フィルタ。
+ * 平均が settings.minAverageVolume 以下なら除外する。取得できなかった銘柄は
+ * 落とさず、AVG_VOLUME=null のまま残す（株探側の変更で全滅する事故を防ぐ）。
+ */
+function applyVolumeFilter(stocks, settings, useCache = true, onProgress, cacheOnly = false) {
+  const s = settings || DEFAULT_SETTINGS;
+  const kept = [];
+  const dropped = [];
+  (stocks || []).forEach((stock, index) => {
+    const result = getAverageVolume(stock.TICKER, useCache, cacheOnly);
+    stock.AVG_VOLUME = result.average;
+    if (result.average !== null && result.average <= s.minAverageVolume) {
+      dropped.push(stock.TICKER);
+    } else {
+      kept.push(stock);
+    }
+    if (onProgress) onProgress(index + 1, stocks.length);
+  });
+  if (dropped.length > 0) {
+    Logger.log('出来高フィルタで除外: ' + dropped.length + '件 (' + dropped.join(', ') + ')');
+  }
+  return kept;
+}
 
 /**
  * キャッシュキーを生成
@@ -60,6 +261,8 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('株価取得')
     .addItem('銘柄データ更新', 'create_pickup_stocks')
+    .addItem('キャッシュで再判定（取得しない）', 'create_pickup_stocks_from_cache')
+    .addItem('settingsシートを開く', 'openSettingsSheet')
     .addSeparator()
     .addItem('キャッシュクリア', 'clearAllCache')
     .addToUi();
@@ -96,10 +299,38 @@ function clearAllCache() {
   }
 }
 
+/** settings シートを用意してアクティブにする（メニュー用） */
+function openSettingsSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ensureSettingsSheet(ss);
+  ss.setActiveSheet(sheet);
+  SpreadsheetApp.getActiveSpreadsheet().toast(
+    'C列の値を変えると次回更新から反映されます（株価上限の目安: '
+    + getMaxStockPrice(getSettings(ss)).toLocaleString() + '円）', 'settings', 5);
+}
+
 function create_pickup_stocks(){
+  runPickup(false);
+}
+
+/**
+ * ネット取得を一切せず、キャッシュ済みの生データに現在の settings だけを
+ * 適用して pickup を作り直す。settings を変えた直後の再判定用。
+ * キャッシュは最大1時間で消えるため、それを過ぎるとデータなしとして案内する。
+ */
+function create_pickup_stocks_from_cache(){
+  runPickup(true);
+}
+
+function runPickup(cacheOnly){
 
   // キャッシュを有効化（開発時はfalseに設定可能）
   const USE_CACHE = true;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const settings = getSettings(ss);
+  Logger.log('適用設定: ' + JSON.stringify(settings)
+    + ' / 株価上限の目安: ' + getMaxStockPrice(settings) + '円');
   
   // プログレスバー用のHTMLを表示
   showProgress('データ取得中...', 0);
@@ -116,50 +347,82 @@ function create_pickup_stocks(){
   let stockTable = []
   const totalIndustries = iList.length;
   let processedIndustries = 0;
+  let cacheMissPages = 0;
 
   for ( let industry of iList){
 
       for ( let pageNo = 1; pageNo < CONFIG.MAX_PAGES; pageNo++ ){
 
-        const result = get_stocks_by_page(industry.CODE, pageNo, USE_CACHE)
-       
+        const result = cacheOnly
+          ? getCachedStocksByPage(industry.CODE, pageNo, settings)
+          : get_stocks_by_page(industry.CODE, pageNo, USE_CACHE, settings)
+
+        if (result.cacheMiss) cacheMissPages++;
         if ( result.done ) break  // そのページにデータなし = 最終ページ超え
 
         stockTable = stockTable.concat(result.stocks)
       }
-      
+
       // 進捗を更新
       processedIndustries++;
       const progress = Math.round((processedIndustries / totalIndustries) * 100);
       showProgress('業種 ' + processedIndustries + '/' + totalIndustries + ' 処理中...', progress);
   }
 
-  Logger.log('取得した銘柄数: ' + stockTable.length);
-  
+  Logger.log('取得した銘柄数: ' + stockTable.length
+    + (cacheOnly ? '（キャッシュのみ、ミス ' + cacheMissPages + 'ページ）' : ''));
+
   if (stockTable.length === 0) {
-    const errorMsg = "条件に合う銘柄が見つかりませんでした";
+    const errorMsg = cacheOnly
+      ? "キャッシュにデータがありません。「銘柄データ更新」を先に実行してください（キャッシュは最大1時間で消えます）"
+      : "条件に合う銘柄が見つかりませんでした";
     Logger.log(errorMsg);
     SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, '警告', 10);
     return;
   }
-  
+  if (cacheOnly && cacheMissPages > 0) {
+    Logger.log('注意: キャッシュ切れのページが ' + cacheMissPages + ' 件あり、結果が一部欠けている可能性があります');
+  }
+
+  // 第1.5段階: 25日平均出来高による流動性フィルタ（候補だけ個別取得する）
+  const beforeVolume = stockTable.length;
+  stockTable = applyVolumeFilter(stockTable, settings, USE_CACHE, (done, total) => {
+    showProgress('出来高確認中 ' + done + '/' + total + '...', 90);
+  }, cacheOnly);
+  Logger.log('出来高フィルタ: ' + beforeVolume + '件 → ' + stockTable.length + '件');
+
+  if (stockTable.length === 0) {
+    const errorMsg = "出来高条件に合う銘柄が見つかりませんでした";
+    Logger.log(errorMsg);
+    SpreadsheetApp.getActiveSpreadsheet().toast(errorMsg, '警告', 10);
+    return;
+  }
+
   showProgress('スプレッドシートに書き込み中...', 95);
 
-  stockTable.sort((a, b) => Number(a.TICKER) - Number(b.TICKER));
+  // 割安な順（ミックス係数の小さい順）。同点はコード順（英字付きコードでも崩れないよう文字列比較）
+  stockTable.sort((a, b) => (a.MIX - b.MIX) || String(a.TICKER).localeCompare(String(b.TICKER)));
 
-  const sheet = SpreadsheetApp.getActiveSheet()
-  
+  // 出力先は pickup シートに固定する。アクティブシートを消すと settings を
+  // 開いたまま更新したときに設定ごと消えるため、getActiveSheet は使わない。
+  let sheet = ss.getSheetByName(OUTPUT_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(OUTPUT_SHEET_NAME);
+  }
+
   // シートをクリア
   sheet.clear()
   Logger.log('シートをクリアしました')
-  Logger.log('アクティブシート名: ' + sheet.getName());
+  Logger.log('出力シート名: ' + sheet.getName());
 
   // ヘッダーとデータを配列にまとめる
-  let header = ['コード','名称','株価','前日比','騰落率','PER','PBR','配当利回']
+  let header = ['コード','名称','株価','前日比','騰落率','PER','PBR','配当利回','ミックス係数','購入金額（単元）','出来高（25日平均）']
   let allData = [header]
 
   for( let stock of stockTable ){
-    const rowData = [stock.TICKER, stock.NAME, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER, stock.PBR, stock.DPS]
+    const rowData = [stock.TICKER, stock.NAME, stock.PRICE, stock.CHANGE, stock.CHANGE_RATE, stock.PER, stock.PBR, stock.DPS,
+      stock.MIX, Number(stock.PRICE) * settings.unitShares,
+      (stock.AVG_VOLUME === null || stock.AVG_VOLUME === undefined) ? '不明' : stock.AVG_VOLUME]
     allData.push(rowData)
   }
 
@@ -196,8 +459,8 @@ function create_pickup_stocks(){
     throw e;
   }
   
-  // 最終更新日時を記録（J列に移動）
-  const lastUpdateCell = sheet.getRange('J1');
+  // 最終更新日時を記録（ヘッダーが K 列まで伸びたため M 列へ）
+  const lastUpdateCell = sheet.getRange('M1');
   const now = new Date();
   const formattedDate = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
   lastUpdateCell.setValue('最終更新: ' + formattedDate);
@@ -294,23 +557,28 @@ function create_industrycodelist(useCache = true){
  * 戻り値: { stocks: [...], done: bool }
  *   stocks: フィルタ条件を満たす銘柄リスト
  *   done: true = このページにデータなし → ループ終了すべき
+ *
+ * キャッシュにはフィルタ前の生データを保存する。settings を変えたら
+ * キャッシュクリアなしで次回実行から即反映される。
  */
-function get_stocks_by_page(industryCode, pageNo, useCache = true){
+function get_stocks_by_page(industryCode, pageNo, useCache = true, settings){
 
+  const s = settings || DEFAULT_SETTINGS;
   const cache = CacheService.getScriptCache();
   const cacheKey = getCacheKey('stocks', encodeURIComponent(industryCode), pageNo);
-  
-  // キャッシュから取得を試みる
+
+  // キャッシュから生データを取得を試みる
   if (useCache) {
     const cached = cache.get(cacheKey);
     if (cached != null) {
-      return JSON.parse(cached);
+      const raw = JSON.parse(cached);
+      return { stocks: applyScreening(raw.stocks, s), done: raw.done };
     }
   }
 
   const encodedIndustry = encodeURIComponent(industryCode);
   const url = 'https://s.kabutan.jp/sectors/' + encodedIndustry + '/?page=' + pageNo;
-  let result = { stocks: [], done: false };
+  let raw = { stocks: [], done: false };
 
   try {
     const text = fetchWithUserAgent(url);
@@ -318,17 +586,17 @@ function get_stocks_by_page(industryCode, pageNo, useCache = true){
     // <tbody>〜</tbody> を抽出
     const tbodyMatch = text.match(/<tbody>([\s\S]*?)<\/tbody>/);
     if (!tbodyMatch) {
-      result.done = true;
-      cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
-      return result;
+      raw.done = true;
+      cache.put(cacheKey, JSON.stringify(raw), CONFIG.CACHE_STOCK_DURATION);
+      return { stocks: [], done: true };
     }
 
     const tbody = tbodyMatch[1];
     const trMatches = tbody.match(/<tr>([\s\S]*?)<\/tr>/g);
     if (!trMatches) {
-      result.done = true;
-      cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
-      return result;
+      raw.done = true;
+      cache.put(cacheKey, JSON.stringify(raw), CONFIG.CACHE_STOCK_DURATION);
+      return { stocks: [], done: true };
     }
 
     let parsedCount = 0;
@@ -336,27 +604,40 @@ function get_stocks_by_page(industryCode, pageNo, useCache = true){
       const stockData = get_stock_data(row);
       if (stockData && stockData.TICKER) {
         parsedCount++;
-        // グレアムのミックス係数フィルタ（欠損時は判定不能として除外）
-        if (stockData.MIX !== null && stockData.MIX < CONFIG.GRAHAM_MIX_THRESHOLD && stockData.DPS >= CONFIG.DIVIDEND_YIELD_THRESHOLD) {
-          result.stocks.push(stockData);
-        }
+        raw.stocks.push(stockData);
       }
     }
 
     // ティッカーが1件も取れなかった = ページ範囲外
     if (parsedCount === 0) {
-      result.done = true;
+      raw.done = true;
     }
 
-    cache.put(cacheKey, JSON.stringify(result), CONFIG.CACHE_STOCK_DURATION);
+    cache.put(cacheKey, JSON.stringify(raw), CONFIG.CACHE_STOCK_DURATION);
 
   } catch(e) {
     Logger.log('銘柄ページ取得エラー (業種:' + industryCode + '/ページ' + pageNo + '): ' + e.toString());
-    result.done = true;  // エラー時もループを止める
-    return result;
+    return { stocks: [], done: true };  // エラー時もループを止める（キャッシュしない）
   }
 
-  return result;
+  return { stocks: applyScreening(raw.stocks, s), done: raw.done };
+}
+
+/**
+ * キャッシュ済みの生データだけから1ページ分を返す（ネット取得はしない）。
+ * キャッシュに無ければ cacheMiss: true を返し、その業種は打ち切る。
+ * 戻り値の形は get_stocks_by_page と揃える。
+ */
+function getCachedStocksByPage(industryCode, pageNo, settings) {
+  const s = settings || DEFAULT_SETTINGS;
+  const cache = CacheService.getScriptCache();
+  const cacheKey = getCacheKey('stocks', encodeURIComponent(industryCode), pageNo);
+  const cached = cache.get(cacheKey);
+  if (cached == null) {
+    return { stocks: [], done: true, cacheMiss: true };
+  }
+  const raw = JSON.parse(cached);
+  return { stocks: applyScreening(raw.stocks, s), done: raw.done, cacheMiss: false };
 }
 
 /**

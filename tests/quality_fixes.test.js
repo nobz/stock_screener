@@ -58,7 +58,8 @@ function loadModules() {
     + '\n' + fs.readFileSync(path.join(root, 'stock_screener.gs'), 'utf8');
   const factory = new Function(
     src + '; return { get_stock_data, get_stocks_by_page, get_neatprice,'
-    + ' getprice_kabutan, clearAllCache, CONFIG,'
+    + ' getprice_kabutan, clearAllCache, CONFIG, DEFAULT_SETTINGS, getMaxStockPrice,'
+    + ' parseDailyVolumes, computeAverageVolume, getAverageVolume, applyVolumeFilter, getCachedStocksByPage,'
     + ' createYahooFinanceFormula: typeof createYahooFinanceFormula === "function"'
     + ' ? createYahooFinanceFormula : undefined };'
   );
@@ -126,6 +127,109 @@ test('条件を満たす正常な銘柄は残る', () => {
   const result = m.get_stocks_by_page('テスト業種', 1, false);
   assert.equal(result.stocks.length, 1);
   assert.equal(result.stocks[0].MIX, 8);
+});
+
+test('予算上限を超える値がさ株は除外される（株価3,500円×100株=35万円）', () => {
+  const m = loadModules();
+  const row = `<tbody><tr><th><a href="/stocks/7203/"><abbr title="値がさテスト">値がさ</abbr></a></th>`
+    + `<td>3,500</td><td><span class='plus-num'>+50</span><br><span class="text-2xs plus-num">2.04</span></td>`
+    + `<td>8.0倍</td><td>1.0倍</td><td>4.0%</td></tr></tbody>`;
+  fetchImpl = () => okResponse(row);
+  const result = m.get_stocks_by_page('テスト業種', 1, false, m.DEFAULT_SETTINGS);
+  assert.equal(result.stocks.length, 0);
+});
+
+test('予算を緩めれば同じ銘柄が通る（settings が即反映される）', () => {
+  const m = loadModules();
+  const row = `<tbody><tr><th><a href="/stocks/7203/"><abbr title="値がさテスト">値がさ</abbr></a></th>`
+    + `<td>3,500</td><td><span class='plus-num'>+50</span><br><span class="text-2xs plus-num">2.04</span></td>`
+    + `<td>8.0倍</td><td>1.0倍</td><td>4.0%</td></tr></tbody>`;
+  fetchImpl = () => okResponse(row);
+  const settings = Object.assign({}, m.DEFAULT_SETTINGS, { maxBudgetPerStock: 400000 });
+  const result = m.get_stocks_by_page('テスト業種', 1, false, settings);
+  assert.equal(result.stocks.length, 1);
+  assert.equal(m.getMaxStockPrice(m.DEFAULT_SETTINGS), 3000);
+});
+
+// 株探の時系列ページ風HTMLを作る（各行: 日付 + 6列 + 売買高）
+function kabukaHtml(volumes) {
+  const rows = volumes.map((v, i) => {
+    const day = String(20 - i).padStart(2, '0');
+    return `<tr><th scope="row"><time datetime="2026-11-${day}">26/11/${day}</time></th>`
+      + `<td>100</td><td>110</td><td>90</td><td>105</td><td>+5</td><td>5.00</td>`
+      + `<td>${v.toLocaleString('en-US')}</td></tr>`;
+  });
+  return `<html><body><table>${rows.join('')}</table></body></html>`;
+}
+
+test('時系列ページから25日平均出来高を計算する', () => {
+  const m = loadModules();
+  fetchImpl = () => okResponse(kabukaHtml(Array(25).fill(20000)));
+  const result = m.getAverageVolume('7203', false);
+  assert.equal(result.average, 20000);
+  assert.equal(result.daysUsed, 25);
+});
+
+test('平均出来高ちょうど下限（10,000株）は除外され、超えれば残る', () => {
+  const m = loadModules();
+  const stock = { TICKER: '7203' };
+  fetchImpl = () => okResponse(kabukaHtml(Array(25).fill(10000)));
+  assert.equal(m.applyVolumeFilter([Object.assign({}, stock)], m.DEFAULT_SETTINGS, false).length, 0);
+  fetchImpl = () => okResponse(kabukaHtml(Array(25).fill(10001)));
+  assert.equal(m.applyVolumeFilter([Object.assign({}, stock)], m.DEFAULT_SETTINGS, false).length, 1);
+  fetchImpl = () => okResponse(kabukaHtml(Array(25).fill(9999)));
+  assert.equal(m.applyVolumeFilter([Object.assign({}, stock)], m.DEFAULT_SETTINGS, false).length, 0);
+});
+
+test('25日に満たない場合は取れた日数で平均し、5日未満は不明として残す', () => {
+  const m = loadModules();
+  fetchImpl = () => okResponse(kabukaHtml(Array(10).fill(30000)));
+  const result = m.getAverageVolume('7203', false);
+  assert.equal(result.average, 30000);
+  assert.equal(result.daysUsed, 10);
+  fetchImpl = () => okResponse(kabukaHtml(Array(3).fill(30000)));
+  const few = m.applyVolumeFilter([{ TICKER: '7203' }], m.DEFAULT_SETTINGS, false);
+  assert.equal(few.length, 1);
+  assert.equal(few[0].AVG_VOLUME, null);
+});
+
+test('出来高の取得に失敗しても銘柄は落とさず不明になる', () => {
+  const m = loadModules();
+  fetchImpl = () => { throw new Error('通信失敗'); };
+  const kept = m.applyVolumeFilter([{ TICKER: '7203' }], m.DEFAULT_SETTINGS, false);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].AVG_VOLUME, null);
+});
+
+test('キャッシュ再判定はネット取得せず、新しい閾値だけを適用する', () => {
+  const m = loadModules();
+  const row = `<tbody><tr><th><a href="/stocks/7203/"><abbr title="トヨタ自動車">トヨタ</abbr></a></th>`
+    + `<td>2,500</td><td><span class='plus-num'>+50</span><br><span class="text-2xs plus-num">2.04</span></td>`
+    + `<td>8.0倍</td><td>1.0倍</td><td>4.0%</td></tr></tbody>`;
+  // 通常取得でキャッシュ（生データ）を溜める
+  fetchImpl = () => okResponse(row);
+  assert.equal(m.get_stocks_by_page('テスト業種', 1, true, m.DEFAULT_SETTINGS).stocks.length, 1);
+  // 以後はネットに出たら失敗させる
+  fetchImpl = () => { throw new Error('ネット取得禁止'); };
+  // 利回りを 4.5% に上げると、同じ生データでも落ちる
+  const strict = Object.assign({}, m.DEFAULT_SETTINGS, { dividendYieldThreshold: 4.5 });
+  const filtered = m.getCachedStocksByPage('テスト業種', 1, strict);
+  assert.equal(filtered.stocks.length, 0);
+  assert.equal(filtered.cacheMiss, false);
+  // 緩い閾値なら残る
+  assert.equal(m.getCachedStocksByPage('テスト業種', 1, m.DEFAULT_SETTINGS).stocks.length, 1);
+});
+
+test('キャッシュが無いページはネットに出ず cacheMiss になる', () => {
+  const m = loadModules();
+  fetchImpl = () => { throw new Error('ネット取得禁止'); };
+  const result = m.getCachedStocksByPage('無い業種', 1, m.DEFAULT_SETTINGS);
+  assert.equal(result.cacheMiss, true);
+  assert.equal(result.stocks.length, 0);
+  // 出来高もキャッシュのみモードでは取得しに行かない
+  const vol = m.applyVolumeFilter([{ TICKER: '7203' }], m.DEFAULT_SETTINGS, true, null, true);
+  assert.equal(vol.length, 1);
+  assert.equal(vol[0].AVG_VOLUME, null);
 });
 
 test('銘柄名のダブルクォートを数式用にエスケープする', () => {
