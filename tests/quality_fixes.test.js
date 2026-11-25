@@ -17,6 +17,8 @@ let removeAllError;
 let spreadsheet;
 let lockHeld;
 let fetchAllBatches;
+let triggers;
+let propertiesStore;
 
 // getRange(row, col, numRows, numCols) と setValues/getValues だけを再現する簡易シート
 function makeSheet(name) {
@@ -53,6 +55,7 @@ function makeSpreadsheet() {
   const sheets = new Map();
   return {
     sheets,
+    getId: () => 'test-spreadsheet-id',
     toast: (msg, title) => toasts.push({ msg, title }),
     getSheetByName: (name) => sheets.get(name) || null,
     insertSheet: (name) => {
@@ -74,6 +77,8 @@ function resetMocks() {
   spreadsheet = makeSpreadsheet();
   lockHeld = false;
   fetchAllBatches = [];
+  triggers = [];
+  propertiesStore = new Map();
 }
 
 function loadModules() {
@@ -117,6 +122,32 @@ function loadModules() {
     }),
     getActiveSheet: () => ({}),
     getActiveSpreadsheet: () => spreadsheet,
+    openById: (id) => (id === spreadsheet.getId() ? spreadsheet : null),
+  };
+  global.ScriptApp = {
+    newTrigger: (handler) => ({
+      timeBased: () => ({
+        after: (delayMs) => ({
+          create: () => {
+            const trigger = { getHandlerFunction: () => handler, delayMs };
+            triggers.push(trigger);
+            return trigger;
+          },
+        }),
+      }),
+    }),
+    getProjectTriggers: () => [...triggers],
+    deleteTrigger: (trigger) => {
+      const index = triggers.indexOf(trigger);
+      if (index >= 0) triggers.splice(index, 1);
+    },
+  };
+  global.PropertiesService = {
+    getScriptProperties: () => ({
+      getProperty: (key) => (propertiesStore.has(key) ? propertiesStore.get(key) : null),
+      setProperty: (key, value) => propertiesStore.set(key, String(value)),
+      deleteProperty: (key) => propertiesStore.delete(key),
+    }),
   };
   global.LockService = {
     getScriptLock: () => ({
@@ -138,7 +169,7 @@ function loadModules() {
     + ' getprice_kabutan, clearAllCache, CONFIG, DEFAULT_SETTINGS, getMaxStockPrice,'
     + ' parseDailyVolumes, computeAverageVolume, getAverageVolume, applyVolumeFilter, getCachedStocksByPage,'
     + ' parseAnnualResults, evaluateDividendSafety, getDividendSafety, ensureSettingsSheet, evaluateEarningsQuality,'
-    + ' create_pickup_stocks, create_pickup_stocks_from_cache, getProgress, runPickup,'
+    + ' create_pickup_stocks, create_pickup_stocks_from_cache, getProgress, runPickup, TIME_BUDGET_MS, continuePickupFromTrigger,'
     + ' createYahooFinanceFormula: typeof createYahooFinanceFormula === "function"'
     + ' ? createYahooFinanceFormula : undefined };'
   );
@@ -614,6 +645,79 @@ test('前の実行が動いている間は何もせず busy を返し、history 
   assert.equal(result.busy, true);
   assert.equal(spreadsheet.getSheetByName('history'), null);
   assert.equal(lockHeld, true);
+});
+
+test('1回の実行の時間予算は90秒（150秒では区切りの応答が届かなかった）', () => {
+  const m = loadModules();
+  assert.equal(m.TIME_BUDGET_MS, 90000);
+});
+
+test('時間予算で区切ったら継続トリガーを1つだけ予約し、トリガーから完走して予約が消える', () => {
+  const m = loadModules();
+  fetchImpl = bankFixtureFetch;
+
+  // 予算を負にして即区切る。区切りごとに予約し直してもトリガーは1つだけ
+  assert.equal(m.runPickup(false, -1).done, false);
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0].getHandlerFunction(), 'continuePickupFromTrigger');
+  assert.equal(m.runPickup(false, -1).done, false);
+  assert.equal(triggers.length, 1);
+  assert.equal(propertiesStore.get('pickup_spreadsheet_id'), 'test-spreadsheet-id');
+  assert.equal(spreadsheet.getSheetByName('pickup'), null);
+
+  // サイドバーを介さずトリガーから続きを実行すると完走し、予約は消える
+  m.continuePickupFromTrigger();
+  assert.ok(spreadsheet.getSheetByName('pickup'));
+  assert.equal(spreadsheet.getSheetByName('history').getLastRow(), 2);
+  assert.equal(triggers.length, 0);
+  assert.equal(lockHeld, false);
+});
+
+test('サイドバーは NetworkError でない失敗でも再接続し、区切りの続きを呼ぶ', () => {
+  const html = fs.readFileSync(path.join(root, 'progress.html'), 'utf8');
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
+    .replace('<?!= JSON.stringify(cacheOnly) ?>', 'false');
+  const elements = {};
+  const timers = [];
+  let calls = 0;
+  let onSuccess;
+  let onFailure;
+  global.document = {
+    getElementById: (id) => elements[id]
+      || (elements[id] = { style: {}, classList: { add: () => {} }, textContent: '' }),
+  };
+  global.google = {
+    script: {
+      host: { close: () => {} },
+      run: {
+        withSuccessHandler: function (fn) { onSuccess = fn; return this; },
+        withFailureHandler: function (fn) { onFailure = fn; return this; },
+        runPickup: () => {
+          calls++;
+          // 1回目: 文面に NetworkError / HTTP 0 を含まない失敗（旧実装はここで止まった）
+          if (calls === 1) { onFailure(new Error('接続がタイムアウトしました')); return; }
+          // 2回目: 時間予算で区切り、3回目で完了
+          if (calls === 2) { onSuccess({ done: false, message: '一旦区切りました' }); return; }
+          onSuccess({ done: true, message: '完了しました' });
+        },
+        getProgress: () => onSuccess(null),
+      },
+    },
+  };
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  global.setTimeout = (fn) => { timers.push(fn); return timers.length; };
+  global.setInterval = () => 0;
+  try {
+    new Function(script)();
+    for (let i = 0; i < 50 && timers.length > 0; i++) timers.shift()();
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+  }
+  assert.equal(calls, 3);
+  assert.equal(elements.message.textContent, '完了しました');
+  assert.equal(elements.close.style.display, 'inline-block');
 });
 
 test('銘柄名のダブルクォートを数式用にエスケープする', () => {

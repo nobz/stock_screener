@@ -681,11 +681,13 @@ function create_pickup_stocks_from_cache(){
  * もう一度呼べば続きから進む。打ち切った回は pickup と history を書き換えない。
  * 戻り値: { done: boolean, message: string }
  */
-function runPickup(cacheOnly, budgetMs){
+function runPickup(cacheOnly, budgetMs, spreadsheet){
+  Logger.log('runPickup 呼び出し (cacheOnly=' + !!cacheOnly + ')');
   // サイドバーとの通信が切れてもサーバー側の実行は続くことがある。
   // そこへ再試行が重なって pickup / history を二重に書かないよう、同時に1つだけ動かす。
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
+    Logger.log('前の実行が動いているため待機を返します');
     return { done: false, busy: true, message: '前の実行がまだ動いています。終わるのを待っています' };
   }
   const startedAt = Date.now();
@@ -694,34 +696,114 @@ function runPickup(cacheOnly, budgetMs){
     if (Date.now() - startedAt > budget) throw new TimeBudgetExceeded();
   };
   try {
-    return { done: true, message: runPickupCore(cacheOnly, checkBudget, startedAt) };
+    const message = runPickupCore(cacheOnly, checkBudget, startedAt, spreadsheet);
+    deleteContinuationTriggers();
+    return { done: true, message: message };
   } catch (e) {
-    if (!(e instanceof TimeBudgetExceeded)) throw e;
+    if (!(e instanceof TimeBudgetExceeded)) {
+      deleteContinuationTriggers();
+      throw e;
+    }
     const message = '一旦区切りました。取得済みの分はキャッシュに残っており、続きから再開します';
     Logger.log(message + '（経過 ' + Math.round((Date.now() - startedAt) / 1000) + '秒）');
     writeProgress({ message: message, percent: 0, done: false });
+    // サイドバーが続きを呼ばなくても進むよう、サーバー側でも続きを予約する。
+    // サイドバーと競合した場合はロックで片方だけが動き、完了時に予約は消える。
+    scheduleContinuation(cacheOnly);
     return { done: false, message: message };
   } finally {
     lock.releaseLock();
   }
 }
 
+/** 続きを実行するトリガーのハンドラ名と、発火までの待ち時間（1分） */
+const CONTINUATION_HANDLER = 'continuePickupFromTrigger';
+const CONTINUATION_DELAY_MS = 60000;
+const CONTINUATION_SPREADSHEET_KEY = 'pickup_spreadsheet_id';
+const CONTINUATION_CACHE_ONLY_KEY = 'pickup_cache_only';
+
+/**
+ * トリガー実行時はアクティブなスプレッドシートが無いため、通常実行のときに
+ * 対象スプレッドシートの ID と実行モードをプロパティへ残しておく。
+ */
+function rememberContinuationTarget(ss, cacheOnly) {
+  try {
+    if (typeof PropertiesService === 'undefined' || !ss || !ss.getId) return;
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty(CONTINUATION_SPREADSHEET_KEY, ss.getId());
+    props.setProperty(CONTINUATION_CACHE_ONLY_KEY, cacheOnly ? '1' : '0');
+  } catch (e) {
+    Logger.log('継続先の保存エラー: ' + e.toString());
+  }
+}
+
+/** 継続トリガーを1つだけ予約する（既存の継続トリガーは作り直す）。失敗してもサイドバー側の継続は残る */
+function scheduleContinuation(cacheOnly) {
+  try {
+    if (typeof ScriptApp === 'undefined') return;
+    deleteContinuationTriggers();
+    ScriptApp.newTrigger(CONTINUATION_HANDLER).timeBased().after(CONTINUATION_DELAY_MS).create();
+    Logger.log('続きを ' + Math.round(CONTINUATION_DELAY_MS / 1000) + '秒後にサーバー側で実行するよう予約しました');
+  } catch (e) {
+    Logger.log('継続トリガーの予約エラー: ' + e.toString());
+  }
+}
+
+function deleteContinuationTriggers() {
+  try {
+    if (typeof ScriptApp === 'undefined') return;
+    ScriptApp.getProjectTriggers()
+      .filter((trigger) => trigger.getHandlerFunction() === CONTINUATION_HANDLER)
+      .forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+  } catch (e) {
+    Logger.log('継続トリガーの削除エラー: ' + e.toString());
+  }
+}
+
+/**
+ * 時間トリガーから続きを実行する。対象は rememberContinuationTarget が残した
+ * スプレッドシート ID で開く。実行中（busy）なら、動いている側が区切り時に
+ * 予約し直す前提で、念のため自分でも予約し直す。
+ */
+function continuePickupFromTrigger() {
+  let ss = null;
+  let cacheOnly = false;
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const spreadsheetId = props.getProperty(CONTINUATION_SPREADSHEET_KEY);
+    cacheOnly = props.getProperty(CONTINUATION_CACHE_ONLY_KEY) === '1';
+    if (spreadsheetId) ss = SpreadsheetApp.openById(spreadsheetId);
+  } catch (e) {
+    Logger.log('継続先スプレッドシートを開けませんでした: ' + e.toString());
+  }
+  if (!ss) {
+    Logger.log('継続先スプレッドシートが不明なため、サーバー側の続きは実行しません');
+    return;
+  }
+  const result = runPickup(cacheOnly, undefined, ss);
+  if (result && result.busy) scheduleContinuation(cacheOnly);
+}
+
 /**
  * 1回の実行で使う時間の上限。GAS の6分制限より、サイドバーからの呼び出しが
- * 長いと通信が切れる（NetworkError: HTTP 0）方が先に起きたため、短く刻む。
+ * 長いと通信が切れる方が先に起きるため、短く刻む。
+ * 150秒でも区切りの応答がサイドバーへ届かず続きが呼ばれない事例があった
+ * （2026-11-24）ため、90秒に縮めた。20回まで続けても最大で約30分であり、
+ * 業種ページのキャッシュ（1時間）の範囲内に収まる。
  */
-const TIME_BUDGET_MS = 150000;
+const TIME_BUDGET_MS = 90000;
 
 function TimeBudgetExceeded() {
   this.name = 'TimeBudgetExceeded';
 }
 
-function runPickupCore(cacheOnly, checkBudget, startedAt){
+function runPickupCore(cacheOnly, checkBudget, startedAt, spreadsheet){
 
   // キャッシュを有効化（開発時はfalseに設定可能）
   const USE_CACHE = true;
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = spreadsheet || SpreadsheetApp.getActiveSpreadsheet();
+  rememberContinuationTarget(ss, cacheOnly);
   const settings = getSettings(ss);
   Logger.log('適用設定: ' + JSON.stringify(settings)
     + ' / 株価上限の目安: ' + getMaxStockPrice(settings) + '円');

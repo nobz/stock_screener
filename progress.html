@@ -61,31 +61,29 @@
       document.getElementById('elapsed').textContent = Math.round((Date.now() - startedAt) / 1000) + '秒';
     }, 1000);
 
-    // サーバー側は2分半ごとに区切って { done: false } を返すので、続きを新しい実行として呼び直す。
+    // サーバー側は90秒ごとに区切って { done: false } を返すので、続きを新しい実行として呼び直す。
     // 取得済みの分はキャッシュに残るので、回を重ねるごとに先へ進む。
-    // 通信エラー（NetworkError）は進み具合が失われないため、待ってから再試行する。
+    // 呼び出しが失敗しても進み具合はキャッシュに残っており、runPickup の再呼び出しは
+    // ロックで二重実行にならないため安全。エラーの文面（NetworkError かどうか等）で
+    // 再試行の要否を分けると、文面が想定と違うだけで続きが二度と呼ばれなくなるので、
+    // 文面によらず待ってから再試行する（上限を超えたら元のエラーを表示して止める）。
     // 前の実行が残っている間（busy）は、終わるまで待つ。
     var MAX_ROUNDS = 20;
-    var MAX_NETWORK_RETRIES = 3;
+    var MAX_FAILURE_RETRIES = 5;
     var MAX_BUSY_WAITS = 30;
     var RETRY_WAIT_MS = 10000;
     var round = 1;
-    var networkRetries = 0;
+    var failureRetries = 0;
     var busyWaits = 0;
 
     function showMessage(text) {
       document.getElementById('message').textContent = text;
     }
 
-    function isNetworkError(error) {
-      var text = String(error && error.message ? error.message : error);
-      return text.indexOf('NetworkError') !== -1 || text.indexOf('HTTP 0') !== -1;
-    }
-
     function run() {
       google.script.run
         .withSuccessHandler(function (result) {
-          networkRetries = 0;
+          failureRetries = 0;
           if (result && result.busy) {
             if (++busyWaits > MAX_BUSY_WAITS) {
               finish('前の実行が終わりませんでした。数分待ってからもう一度実行してください', true);
@@ -110,9 +108,9 @@
         })
         .withFailureHandler(function (error) {
           var text = error && error.message ? error.message : String(error);
-          if (isNetworkError(error) && networkRetries < MAX_NETWORK_RETRIES) {
-            networkRetries++;
-            showMessage('通信が切れたため再接続します（' + networkRetries + '/' + MAX_NETWORK_RETRIES + '）。取得済みの分は失われません');
+          if (failureRetries < MAX_FAILURE_RETRIES) {
+            failureRetries++;
+            showMessage('実行への接続が切れたため再接続します（' + failureRetries + '/' + MAX_FAILURE_RETRIES + '）。取得済みの分は失われません');
             setTimeout(run, RETRY_WAIT_MS);
             return;
           }
